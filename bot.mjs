@@ -26,7 +26,9 @@ const db = new SQL.Database(fs.existsSync(DB_PATH) ? fs.readFileSync(DB_PATH) : 
 
 function saveDb() { const d = db.export(); fs.writeFileSync(DB_PATH, Buffer.from(d)); }
 let saveTimer = null;
+let autosaveEnabled = true;
 function dbSaveSoon() {
+  if (!autosaveEnabled) return;
   if (saveTimer) return;
   saveTimer = setTimeout(() => {
     saveTimer = null;
@@ -125,6 +127,7 @@ function countLabel(type) { return type === "member" ? "👥 تعداد ممبر
 function orderTarget(o) { return o.type === "member" ? o.gift_link : o.gift_name || o.gift_link; }
 
 // ---- UX Fix helpers ----
+function esc(s) { return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
 function extractEmoji(text) {
   const chars = Array.from(text ?? "");
   const RE = /(\p{Extended_Pictographic}(️|‍\p{Extended_Pictographic})*)/u;
@@ -557,7 +560,7 @@ async function handleMessage(msg) {
   // Only process private messages
   if (msg.chat.type !== "private") return;
   // Ignore service messages
-  if (!msg.from || !msg.text && !msg.photo) return;
+  if (!msg.from || (!msg.text && !msg.photo && !msg.document)) return;
 
   const chatId = msg.chat.id, tgId = msg.from.id, text = msg.text || "";
   const username = msg.from.username, firstName = msg.from.first_name || "کاربر";
@@ -604,6 +607,62 @@ async function handleMessage(msg) {
     } catch (e) {
       await send(chatId, `❌ کانال: ${ch}\nپست: ${num}\nخطا: ${e.description || e.message}`);
     }
+    return;
+  }
+
+  // === Database migration commands ===
+  if (text === "/dumpdb") {
+    if (!isAdmin(tgId)) return send(chatId, "❌ ادمین نیستید.");
+    try { saveDb(); } catch {}
+    const fd = new FormData();
+    fd.append("chat_id", String(chatId));
+    fd.append("caption", "📦 پشتیبان دیتابیس — " + new Date().toISOString());
+    fd.append("document", new Blob([fs.readFileSync(DB_PATH)]), "bot.db");
+    const r = await fetch(`${API}/sendDocument`, { method: "POST", body: fd });
+    const j = await r.json();
+    if (!j.ok) await send(chatId, "❌ ارسال بکاپ ناموفق: " + (j.description || ""));
+    return;
+  }
+
+  if (text === "/loaddb") {
+    if (!isAdmin(tgId)) return send(chatId, "❌ ادمین نیستید.");
+    dbRun(`UPDATE users SET admin_state='awaiting_db_load', updated_at=unixepoch() WHERE telegram_id=${tgId}`);
+    await send(chatId, `📤 حالا فایل دیتابیس (.db) را در همین چت بفرستید.\n⚠️ دیتابیس فعلی بکاپ و بعد جایگزین می‌شود و ربات ری‌استارت می‌شود.`,
+      { reply_markup: { inline_keyboard: [[BTN.danger("❌ انصراف", "admin_back")]] } });
+    return;
+  }
+
+  if (msg.document && isAdmin(tgId) && user.admin_state === "awaiting_db_load") {
+    dbRun(`UPDATE users SET admin_state=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`);
+    const meta = await api("getFile", { file_id: msg.document.file_id });
+    if (!meta.ok) return send(chatId, "❌ getFile ناموفق: " + (meta.description || ""));
+    const res = await fetch(`https://api.telegram.org/file/bot${BOT_TOKEN}/${meta.result.file_path}`);
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.subarray(0, 16).toString("latin1") !== "SQLite format 3\0")
+      return send(chatId, "❌ این فایل یک دیتابیس SQLite معتبر نیست.");
+    try { fs.copyFileSync(DB_PATH, DB_PATH + ".bak-" + Date.now()); } catch {}
+    autosaveEnabled = false;
+    if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+    fs.writeFileSync(DB_PATH, buf);
+    await send(chatId, "✅ دیتابیس جایگزین شد. ربات در حال ری‌استارت...");
+    process.exit(2);
+  }
+
+  if (text.startsWith("/reimg")) {
+    if (!isAdmin(tgId)) return send(chatId, "❌ ادمین نیستید.");
+    const parts = text.trim().split(/\s+/);
+    if (parts[1] === "list") {
+      const missing = dbAll("SELECT id, name, emoji FROM gifts WHERE is_active=1 AND (image_file_id IS NULL OR image_file_id='')");
+      return send(chatId, missing.length
+        ? "📉 گیفت‌های بدون عکس:\n" + missing.map(g => `<code>${g.id}</code>: ${g.emoji} ${g.name}`).join("\n") + `\n\nعکس را با کپشن عددی در کانال عکس بگذارید، بعد:\n<code>/reimg &lt;id&gt; &lt;کپشن&gt;</code>`
+        : "همه گیفت‌ها عکس دارند ✅");
+    }
+    const gid = parseInt(parts[1]); const cap = (parts[2] || "").trim();
+    if (!gid || !cap) return send(chatId, "فرمت: <code>/reimg 3 5</code>\nیا: <code>/reimg list</code>");
+    const fid = globalThis.giftImageCache?.[cap];
+    if (!fid) return send(chatId, `❌ عکسی با کپشن ${cap} در کش نیست.\nعکس را در کانال عکس (تنظیم‌شده با /setimgchannel) با کپشن عددی ${cap} پست کنید و دوباره امتحان کنید.`);
+    dbRun(`UPDATE gifts SET image_file_id='${fid}' WHERE id=${gid}`);
+    await send(chatId, `✅ عکس گیفت ${gid} ست شد.`);
     return;
   }
 
@@ -1632,10 +1691,16 @@ async function handleCallback(cq) {
       [BTN.neutral("🔙 بازگشت به لیست گیفت‌ها", "gift_list_back")],
     ]}};
     if (gift.image_file_id) {
-      try { await deleteMsg(chatId, msgId); } catch {}
-      await sendPhoto(chatId, gift.image_file_id, giftInfo, kb);
+      const r = await sendPhoto(chatId, gift.image_file_id, giftInfo, kb);
+      if (r.ok) {
+        try { await deleteMsg(chatId, msgId); } catch {}
+      } else {
+        console.warn(`⚠️ sendPhoto failed for gift ${gift.id}:`, r.description);
+        dbRun(`UPDATE gifts SET image_file_id=NULL WHERE id=${gift.id}`);
+        await editSmart(chatId, msgId, giftInfo + `\n⚠️ <i>عکس این گیفت موقتاً در دسترس نیست.</i>`, kb);
+      }
     } else {
-      await edit(chatId, msgId, giftInfo, kb);
+      await editSmart(chatId, msgId, giftInfo, kb);
     }
     return answer(cq.id);
   }
