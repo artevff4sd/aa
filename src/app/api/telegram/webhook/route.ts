@@ -116,14 +116,12 @@ async function showAdminOrders(chatId: number, status: string, page: number = 0)
   let query = db
     .select()
     .from(orders)
-    .orderBy(desc(orders.id));
+    .orderBy(desc(orders.id))
+    .$dynamic();
 
   if (status !== "all") {
-    query = db
-      .select()
-      .from(orders)
-      .where(eq(orders.status, status))
-      .orderBy(desc(orders.id));
+    query = query
+      .where(eq(orders.status, status));
   }
 
   const allOrders = await query;
