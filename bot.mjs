@@ -3,10 +3,14 @@ import "dotenv/config";
 import Database from "sql.js";
 import fs from "fs";
 import path from "path";
+import { fileURLToPath } from "url";
 
 // ==================== Config ====================
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const DB_PATH = process.env.DATABASE_PATH || "./data/bot.db";
+const DB_DIR = path.join(__dirname, "data");
+const DB_PATH = process.env.DB_PATH || path.join(process.cwd(), "data", "bot.db");
 const API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 const ADMIN_IDS = process.env.ADMIN_IDS
   ? process.env.ADMIN_IDS.split(",").map(s => parseInt(s.trim())).filter(n => !isNaN(n))
@@ -17,16 +21,52 @@ if (!BOT_TOKEN) { console.error("❌ TELEGRAM_BOT_TOKEN is not set"); process.ex
 
 // ==================== Database ====================
 const SQL = await Database();
-const dir = path.dirname(DB_PATH);
-if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+if (!fs.existsSync(DB_DIR)) fs.mkdirSync(DB_DIR, { recursive: true });
 const db = new SQL.Database(fs.existsSync(DB_PATH) ? fs.readFileSync(DB_PATH) : new Uint8Array(0));
 
 function saveDb() { const d = db.export(); fs.writeFileSync(DB_PATH, Buffer.from(d)); }
-process.on("exit", saveDb);
-process.on("SIGINT", () => { saveDb(); process.exit(); });
-process.on("SIGTERM", () => { saveDb(); process.exit(); });
+let saveTimer = null;
+function dbSaveSoon() {
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    try { saveDb(); console.log("💾 ذخیره شد"); }
+    catch (e) { console.error("خطای ذخیره:", e.message); }
+  }, 1500);
+}
 
-function dbRun(sql) { db.run(sql); }
+function shutdown(code = 0) { try { saveDb(); } catch {} process.exit(code); }
+process.on("exit", () => { try { saveDb(); } catch {} });
+process.on("SIGINT", () => shutdown(0));
+process.on("SIGTERM", () => shutdown(0));
+process.on("uncaughtException", (e) => { console.error(e); shutdown(1); });
+process.on("unhandledRejection", (e) => console.error("Rejection:", e));
+
+// Lock file to prevent multiple instances
+const LOCK_PATH = path.join(DB_DIR, "bot.lock");
+function acquireLock() {
+  try {
+    if (fs.existsSync(LOCK_PATH)) {
+      const oldPid = parseInt(fs.readFileSync(LOCK_PATH, "utf8"));
+      let alive = false;
+      if (Number.isInteger(oldPid) && oldPid !== process.pid) {
+        try { process.kill(oldPid, 0); alive = true; }
+        catch (e) { alive = e.code === "EPERM"; }
+      }
+      if (alive) {
+        console.error(`⛔ نسخه دیگری از ربات (PID ${oldPid}) همین دیتابیس را باز دارد. اول آن را ببندید.`);
+        process.exit(1);
+      }
+    }
+    fs.writeFileSync(LOCK_PATH, String(process.pid));
+  } catch {}
+  process.on("exit", () => { try { if (fs.existsSync(LOCK_PATH)) fs.unlinkSync(LOCK_PATH); } catch {} });
+}
+
+function dbRun(sql) {
+  db.run(sql);
+  dbSaveSoon();
+}
 function dbGet(sql) { const s = db.prepare(sql); let r = null; if (s.step()) r = s.getAsObject(); s.free(); return r; }
 function dbAll(sql) { const s = db.prepare(sql); const r = []; while (s.step()) r.push(s.getAsObject()); s.free(); return r; }
 
@@ -85,6 +125,14 @@ function countLabel(type) { return type === "member" ? "👥 تعداد ممبر
 function orderTarget(o) { return o.type === "member" ? o.gift_link : o.gift_name || o.gift_link; }
 
 // ---- UX Fix helpers ----
+function extractEmoji(text) {
+  const chars = Array.from(text ?? "");
+  const RE = /(\p{Extended_Pictographic}(️|‍\p{Extended_Pictographic})*)/u;
+  for (const ch of chars) {
+    if (RE.test(ch)) return ch;
+  }
+  return null;
+}
 function normalizeDigits(s) {
   return String(s)
     .replace(/[۰-۹]/g, ch => "۰۱۲۳۴۵۶۷۸۹".indexOf(ch))
@@ -521,6 +569,44 @@ async function handleMessage(msg) {
   if (text === "/pending") { if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید."); await showOrders(chatId, "pending_approval"); return; }
   if (text === "/orders") { if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید."); await showOrders(chatId, "all"); return; }
 
+  // === تشخیص کانال ===
+  if (text === "/chaninfo") {
+    if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید.");
+    const ch = getSetting("channel");
+    if (!ch) return send(chatId, "❌ کانال گزارشات تنظیم نشده.");
+    try {
+      const c = await api("getChat", { chat_id: ch });
+      await send(chatId, `✅ <b>کانال فعال بات:</b> <code>${ch}</code>\n📛 <b>عنوان:</b> ${c.result.title}`);
+    } catch (e) {
+      await send(chatId, `❌ <b>بات به این کانال دسترسی ندارد:</b>\n<code>${e.description || e.message || "خطای ناشناخته"}</code>`);
+    }
+    return;
+  }
+
+  if (text === "/chkeys") {
+    if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید.");
+    const res = db.exec(`SELECT key, value FROM settings WHERE key LIKE '%chan%' OR key LIKE '%channel%' OR key LIKE '%کانال%'`);
+    const rows = res[0]?.values ?? [];
+    await send(chatId, rows.length
+      ? "🔑 کلیدهای کانال:\n" + rows.map(r => `${r[0]} = ${r[1]}`).join("\n")
+      : "هیچ کلیدی با نام کانال پیدا نشد");
+    return;
+  }
+
+  if (text.startsWith("/chtest")) {
+    if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید.");
+    const num = parseInt(text.split(/\s+/)[1]);
+    const ch = getSetting("channel");
+    if (!num) return send(chatId, "فرمت: /chtest 15");
+    try {
+      await api("copyMessage", { chat_id: tgId, from_chat_id: ch, message_id: num });
+      await send(chatId, `✅ پست ${num} در کانال ${ch} پیدا شد`);
+    } catch (e) {
+      await send(chatId, `❌ کانال: ${ch}\nپست: ${num}\nخطا: ${e.description || e.message}`);
+    }
+    return;
+  }
+
   // Admin: Add gift step-by-step
   if (text === "/addgift") {
     if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید.");
@@ -566,7 +652,7 @@ async function handleMessage(msg) {
     if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید.");
     const parts = String(freshUser.admin_state_data || "").split("|");
     const giftName = parts[0], starCount = parseInt(parts[1]);
-    const emoji = (text || "🎁").trim().charAt(0) || "🎁";
+    const emoji = extractEmoji(text) || "🎁";
     dbRun(`UPDATE users SET admin_state='addgift_desc', admin_state_data='${parts.join("|").replace(/'/g, "''")}|${emoji.replace(/'/g, "''")}', updated_at=unixepoch() WHERE telegram_id=${tgId}`);
     await send(chatId,
       `🎁 <b>اضافه کردن گیفت جدید</b>\n${SEPARATOR}\n\n` +
@@ -2222,7 +2308,10 @@ async function poll() {
 
 // ==================== Start ====================
 async function main() {
+  acquireLock();
   console.log(`🤖 ${BOT_NAME} Bot starting...`);
+  console.log(`📦 دیتابیس: ${DB_PATH}`);
+  console.log(`🎁 گیفتها: ${dbGet("SELECT COUNT(*) AS c FROM gifts")?.c ?? 0}`);
   const me = await api("getMe");
   if (!me.ok) { console.error("❌ Cannot connect:", me.description); process.exit(1); }
   console.log(`✅ Bot: @${me.result.username}`);
