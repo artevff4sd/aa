@@ -515,6 +515,7 @@ async function sendDbBackup(targetChatId, isAuto = false) {
       `🤖 ربات: ${BOT_NAME}\n` +
       `🕒 ${toJalali(new Date())}\n` +
       `🎁 گیفتها: <code>${dbGet("SELECT COUNT(*) AS c FROM gifts")?.c ?? 0}</code> — 👥 کاربران: <code>${dbGet("SELECT COUNT(*) AS c FROM users")?.c ?? 0}</code> — 📋 سفارشات: <code>${dbGet("SELECT COUNT(*) AS c FROM orders")?.c ?? 0}</code>`);
+    fd.append("parse_mode", "HTML");
     fd.append("document", new Blob([dbBuf]), `pepestar-${new Date().toISOString().slice(0,10)}-${isAuto ? "auto" : "manual"}.db`);
     const r = await fetch(`${API}/sendDocument`, { method: "POST", body: fd });
     const j = await r.json();
@@ -738,6 +739,7 @@ async function handleMessage(msg) {
     const fd = new FormData();
     fd.append("chat_id", String(chatId));
     fd.append("caption", "📦 پشتیبان دیتابیس — " + new Date().toISOString());
+    fd.append("parse_mode", "HTML");
     fd.append("document", new Blob([fs.readFileSync(DB_PATH)]), "bot.db");
     const r = await fetch(`${API}/sendDocument`, { method: "POST", body: fd });
     const j = await r.json();
