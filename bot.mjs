@@ -689,6 +689,17 @@ async function handleMessage(msg) {
   const user = ensureUser(tgId, username, firstName);
   const freshUser = dbGet(`SELECT * FROM users WHERE id=${user.id}`) || user;
 
+  // ===== Maintenance gate (کاربران عادی وقتی بات خاموش است) =====
+  if (!isAdmin(tgId) && getSetting("bot_enabled") === "0") {
+    return send(chatId,
+      `🛠 <b>ربات موقتاً خاموش است</b>\n${SEPARATOR}\n\n` +
+      `در حال بروزرسانی یا تعمیر هستیم.\n` +
+      `⏳ لطفاً کمی دیگر دوباره سر بزنید.`,
+      { reply_markup: { inline_keyboard: [
+        [BTN.neutral("🔄 بررسی مجدد", "main_menu")],
+      ]}});
+  }
+
   // Admin commands
   if (text === "/admin" || text === "/panel") { if (!isAdmin(tgId)) return send(chatId, "❌ <b>شما دسترسی ادمین ندارید.</b>"); await adminMenu(chatId); return; }
   if (text === "/pending") { if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید."); await showOrders(chatId, "pending_approval"); return; }
@@ -1719,6 +1730,40 @@ async function handleCallback(cq) {
     return answer(cq.id);
   }
 
+  // ===== Maintenance gate =====
+  if (!isAdmin(tgId) && data !== "main_menu" && getSetting("bot_enabled") === "0") {
+    return answer(cq.id, "🛠 ربات موقتاً خاموش است. کمی دیگر برگردید.", true);
+  }
+
+  // Main menu callback (from 🔄 بررسی مجدد button)
+  if (data === "main_menu") {
+    if (!isAdmin(tgId) && getSetting("bot_enabled") === "0") {
+      await editSmart(chatId, msgId,
+        `🛠 <b>ربات موقتاً خاموش است</b>\n${SEPARATOR}\n\nدر حال بروزرسانی — لطفاً کمی دیگر دوباره امتحان کنید.`,
+        { reply_markup: { inline_keyboard: [[BTN.neutral("🔄 بررسی مجدد", "main_menu")]] } });
+      return answer(cq.id);
+    }
+    // Bot is on or admin — show main menu
+    dbRun(`UPDATE users SET state='idle', pending_gift_link=NULL, pending_star_count=NULL, admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`);
+    dbRun(`UPDATE orders SET status='cancelled', updated_at=unixepoch() WHERE user_id=${user.id} AND status='pending'`);
+    await editSmart(chatId, msgId,
+      `✨ <b>${BOT_NAME} Bot</b> ✨\n` +
+      `🎁 خرید گیفت و استار تلگرام\n` +
+      `${SEPARATOR}\n` +
+      `🌟 از منوی زیر، سرویس موردنظرت رو انتخاب کن:\n` +
+      `${SEPARATOR}\n` +
+      `⚡️ سریع • امن • آسان`,
+      { reply_markup: { inline_keyboard: [
+        btnRow(BTN.success("🎁  خرید گیفت تلگرام", "menu_gift")),
+        btnRow(BTN.success("⭐️  خرید استار تلگرام", "menu_star")),
+        btnRow(BTN.success("👤  خرید ممبر", "menu_member")),
+        btnRow(BTN.primary("📦  سفارش‌های من", "menu_orders")),
+        btnRow(BTN.primary("💬  پشتیبانی", "menu_support")),
+      ]}}
+    );
+    return answer(cq.id);
+  }
+
   // Main menu callbacks
   if (data === "menu_back") {
     // Reset conversation state and cancel any pending orders
@@ -2225,6 +2270,7 @@ async function handleCallback(cq) {
     dbRun(`UPDATE users SET admin_state='awaiting_danger_confirm', updated_at=unixepoch() WHERE telegram_id=${tgId}`);
     await send(chatId,
       `🔴 <b>Danger Zone</b>\n${SEPARATOR}\n\n` +
+      `⚡️ <b>وضعیت بات:</b> ${getSetting("bot_enabled") === "0" ? "🔴 خاموش (کاربران عادی بلاک‌اند)" : "🟢 روشن"}\n\n` +
       `⚠️ <b>هشدار:</b> این عملیات غیرقابل بازگشت است!\n\n` +
       `🗑️ <b>چیزی که حذف میشه:</b>\n` +
       `   • همه سفارشات\n` +
@@ -2238,9 +2284,28 @@ async function handleCallback(cq) {
       `${SEPARATOR}\n` +
       `📝 برای تایید، کلمه رو بفرستید:\n` +
       `<code>DangerZone</code>`,
-      { reply_markup: { inline_keyboard: [[BTN.danger("انصراف", "admin_back")]] } }
+      { reply_markup: { inline_keyboard: [
+        [BTN.danger(getSetting("bot_enabled") === "0" ? "🟢 روشن کردن بات" : "🔴 خاموش کردن بات", "toggle_bot_power")],
+        [BTN.danger("انصراف", "admin_back")],
+      ] } }
     );
     return answer(cq.id);
+  }
+
+  if (data === "toggle_bot_power") {
+    if (!isAdmin(tgId)) return answer(cq.id);
+    const cur = getSetting("bot_enabled") === "0";
+    setSetting("bot_enabled", cur ? "1" : "0");
+    if (cur) {
+      await answer(cq.id, "بات روشن شد 🟢");
+      await send(chatId, "🟢 <b>بات برای کاربران روشن شد.</b>\nهمه امکانات خرید در دسترس است.");
+      console.log("🟢 Bot enabled by admin");
+    } else {
+      await answer(cq.id, "بات خاموش شد 🔴");
+      await send(chatId, "🔴 <b>بات برای کاربران خاموش شد.</b>\nکاربران عادی تا روشن‌کردن مجدد پیام «خاموش» میبینند. پنل ادمین فعال است.");
+      console.log("🔴 Bot disabled by admin");
+    }
+    return;
   }
 
   if (data === "admin_all") { if (isAdmin(tgId)) await showOrders(chatId, "all"); return answer(cq.id); }
