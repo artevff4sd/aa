@@ -41,7 +41,7 @@ function shutdown(code = 0) { try { saveDb(); } catch {} process.exit(code); }
 process.on("exit", () => { try { saveDb(); } catch {} });
 process.on("SIGINT", () => shutdown(0));
 process.on("SIGTERM", () => shutdown(0));
-process.on("uncaughtException", (e) => { console.error(e); shutdown(1); });
+process.on("uncaughtException", (e) => { console.error(e); setTimeout(() => shutdown(1), 4000); });
 process.on("unhandledRejection", (e) => console.error("Rejection:", e));
 
 // Lock file to prevent multiple instances
@@ -285,16 +285,71 @@ async function editKb(chatId, msgId, kb) { return api("editMessageReplyMarkup", 
 async function deleteMsg(chatId, msgId) { return api("deleteMessage", { chat_id: chatId, message_id: msgId }); }
 async function answer(id, text, alert) { return api("answerCallbackQuery", { callback_query_id: id, text, show_alert: alert }); }
 
+// ==================== Error Tracker (admin alerts) ====================
+let errBusy = false;
+let lastErrSendAt = 0;
+let skippedErrs = 0;
+const errDedupe = new Map();
+
+function fmtErrArg(a) {
+  if (a instanceof Error) return a.stack || `${a.name}: ${a.message}`;
+  if (typeof a === "object" && a !== null) { try { return JSON.stringify(a); } catch { return String(a); } }
+  return String(a);
+}
+
+async function reportError(args) {
+  try {
+    const raw = args.map(fmtErrArg).join(" | ");
+    if (!raw || raw.trim().length < 3) return;
+    const now = Date.now();
+    const key = raw.slice(0, 160);
+    let d = errDedupe.get(key);
+    if (!d || now - d.firstAt > 5 * 60 * 1000) { d = { n: 0, firstAt: now }; errDedupe.set(key, d); if (errDedupe.size > 50) for (const [k, v] of errDedupe) if (now - v.firstAt > 5 * 60 * 1000) errDedupe.delete(k); }
+    d.n++;
+    if (d.n > 1 && d.n % 10 !== 0) return;
+    if (now - lastErrSendAt < 4000) { skippedErrs++; return; }
+    lastErrSendAt = now;
+    const txt = raw.length > 3200 ? raw.slice(0, 3200) + "\n… (کوتاه شد)" : raw;
+    const env = process.env.RAILWAY_ENVIRONMENT ? "🗄 Railway" : "💻 لوکال";
+    const skipped = skippedErrs ? `\n➕ <b>${skippedErrs}</b> مورد فیلترشده دیگر (spam)` : "";
+    skippedErrs = 0;
+    const body =
+      `🚨 <b>خطای ربات</b>\n` +
+      `${SEPARATOR}\n` +
+      `🗄 محیط: ${env}\n` +
+      `⏱ آپتایم: <code>${Math.floor(process.uptime() / 60)} دقیقه</code>\n` +
+      `🕒 ${toJalali(new Date())}\n` +
+      (d.n > 1 ? `🔁 تکرار: <b>×${d.n} بار</b> در ۵ دقیقه اخیر\n` : "") + skipped +
+      `${SEPARATOR}\n` +
+      `<pre>${String(txt).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</pre>`;
+    for (const adminId of ADMIN_IDS) {
+      const r = await send(adminId, body);
+      if (!r.ok) _ce(`err-tracker send failed to ${adminId}:`, r.description || "?");
+    }
+  } catch { /* tracker should never crash the bot */ }
+}
+
+const _ce = console.error.bind(console);
+console.error = (...args) => {
+  _ce(...args);
+  reportError(args).catch(() => {});
+};
 
 const STATUS_ICON = { pending: "🟡", receipt_sent: "🔵", pending_approval: "🟠", approved: "🟢", rejected: "🔴", completed: "✅", cancelled: "⚫" };
 const STATUS_FA = { pending: "در انتظار رسید", receipt_sent: "رسید ارسال شده", pending_approval: "در انتظار تایید", approved: "تایید شده", rejected: "رد شده", completed: "تکمیل شده", cancelled: "لغو شده" };
 
 // ==================== Auto Cleanup ====================
 function cleanupOldOrders() {
-  const tenDaysAgo = Math.floor(Date.now() / 1000) - (10 * 24 * 60 * 60);
-  dbRun(`DELETE FROM orders WHERE status = 'cancelled' AND updated_at < ${tenDaysAgo}`);
-  dbRun(`DELETE FROM orders WHERE status = 'completed'`);
+  const now = Math.floor(Date.now() / 1000);
+  const d30 = now - 30 * 24 * 60 * 60;
+  const d5  = now - 5  * 24 * 60 * 60;
+  dbRun(`DELETE FROM orders WHERE status='cancelled' AND updated_at < ${d30}`);
+  dbRun(`DELETE FROM orders WHERE status='approved'  AND updated_at < ${d30}`);
+  dbRun(`DELETE FROM orders WHERE status='completed' AND updated_at < ${d5}`);
 }
+
+// Index for faster cleanup queries
+dbRun(`CREATE INDEX IF NOT EXISTS idx_orders_status_updated ON orders(status, updated_at)`);
 
 // Run cleanup on start
 cleanupOldOrders();
@@ -310,6 +365,8 @@ function settingsPanelKb() {
     [BTN.primary("📣 تغییر کانال گزارش", "set_edit_log")],
     [BTN.primary("🖼️ تغییر کانال عکس", "set_edit_img")],
     [BTN.primary("📢 مدیریت کانال‌های الزامی", "set_edit_must")],
+    [BTN.primary("📦 تغییر کانال بکاپ", "set_edit_backup")],
+    [BTN.neutral("📦 بکاپ فوری", "backup_now")],
     [BTN.neutral("🔄 بروزرسانی", "admin_settings")],
     [BTN.neutral("🔙 بازگشت", "admin_back")],
   ]}};
@@ -329,7 +386,8 @@ function settingsPanelText() {
     `💬 <b>پشتیبانی:</b>  @${sup}\n\n` +
     `📣 <b>کانال گزارشات:</b>  ${channel ? `<code>${channel.channel_id}</code> (${channel.channel_name || "-"})` : "❌ تنظیم نشده"}\n` +
     `🖼️ <b>کانال عکس گیفت‌ها:</b>  ${imgChannel ? `<code>${imgChannel.channel_id}</code> (${imgChannel.channel_name || "-"})` : "❌ تنظیم نشده"}\n` +
-    `📢 <b>کانال‌های الزامی:</b>  ${mustChannels.length ? mustChannels.map(c => c.channel_name || c.channel_id).join(", ") : "❌ تنظیم نشده"}\n\n` +
+    `📢 <b>کانال‌های الزامی:</b>  ${mustChannels.length ? mustChannels.map(c => c.channel_name || c.channel_id).join(", ") : "❌ تنظیم نشده"}\n` +
+    `📦 <b>کانال بکاپ خودکار:</b>  ${getSetting("backup_channel") ? `<code>${esc(getSetting("backup_channel"))}</code> (هر ۵ ساعت)` : "❌ تنظیم نشده"}\n\n` +
     `${SEPARATOR}\nروی دکمه مورد نظر بزنید:`
   );
 }
@@ -440,6 +498,36 @@ async function orderDetail(chatId, orderId) {
   else await send(chatId, text, { reply_markup: { inline_keyboard: btns } });
 }
 
+// ==================== Auto DB Backup ====================
+async function sendDbBackup(targetChatId, isAuto = false) {
+  const channelId = getSetting("backup_channel");
+  if (!channelId) {
+    if (!isAuto) await send(targetChatId, "❌ <b>کانال بکاپ تنظیم نشده.</b>\nاز تنظیمات ← «📦 تغییر کانال بکاپ» تنظیمش کنید.");
+    return false;
+  }
+  try { saveDb(); } catch {}
+  try {
+    const dbBuf = fs.readFileSync(DB_PATH);
+    const fd = new FormData();
+    fd.append("chat_id", String(channelId));
+    fd.append("caption",
+      `📦 <b>بکاپ ${isAuto ? "خودکار" : "دستی"} دیتابیس</b>\n` +
+      `🤖 ربات: ${BOT_NAME}\n` +
+      `🕒 ${toJalali(new Date())}\n` +
+      `🎁 گیفتها: <code>${dbGet("SELECT COUNT(*) AS c FROM gifts")?.c ?? 0}</code> — 👥 کاربران: <code>${dbGet("SELECT COUNT(*) AS c FROM users")?.c ?? 0}</code> — 📋 سفارشات: <code>${dbGet("SELECT COUNT(*) AS c FROM orders")?.c ?? 0}</code>`);
+    fd.append("document", new Blob([dbBuf]), `pepestar-${new Date().toISOString().slice(0,10)}-${isAuto ? "auto" : "manual"}.db`);
+    const r = await fetch(`${API}/sendDocument`, { method: "POST", body: fd });
+    const j = await r.json();
+    if (!j.ok) { console.error("❌ Backup send failed:", j.description); if (!isAuto) await send(targetChatId, "❌ ارسال بکاپ ناموفق: " + (j.description || "")); return false; }
+    console.log(`✅ DB backup sent (${isAuto ? "auto" : "manual"})`);
+    return true;
+  } catch (e) { console.error("❌ Backup error:", e.message); if (!isAuto) await send(targetChatId, "❌ خطا در بکاپ: " + e.message); return false; }
+}
+
+async function scheduledBackup() {
+  try { await sendDbBackup(null, true); } catch (e) { console.error("Backup task error:", e.message); }
+}
+
 // ==================== Gift List Helper ====================
 async function showGiftList(chatId, msgId, page = 0) {
   const gifts = dbAll("SELECT * FROM gifts WHERE is_active=1 ORDER BY sort_order ASC");
@@ -519,6 +607,39 @@ async function showGiftListNew(chatId, page = 0) {
     `📊 <b>${gifts.length}</b> گیفت فعال`,
     { reply_markup: { inline_keyboard: buttons } }
   );
+}
+
+// ==================== Gift Edit Card ====================
+async function giftEditCard(chatId, msgId, gid) {
+  const g = dbGet(`SELECT * FROM gifts WHERE id=${parseInt(gid)}`);
+  const backKb = { reply_markup: { inline_keyboard: [[BTN.neutral("🔙 بازگشت به لیست گیفت‌ها", "admin_gifts")]] } };
+  if (!g) {
+    const t = "❌ <b>گیفت یافت نشد.</b>";
+    if (msgId) await editSmart(chatId, msgId, t, backKb); else await send(chatId, t, backKb);
+    return;
+  }
+  const rate = getNumSetting("exchange_rate");
+  const price = g.star_count * rate;
+  const text =
+    `${g.emoji} <b>${g.name}</b>\n${SEPARATOR}\n\n` +
+    `🆔 <b>شناسه:</b> <code>${g.id}</code> — ${g.is_active ? "🟢 فعال" : "🔴 غیرفعال"} — ترتیب: <code>${g.sort_order}</code>\n\n` +
+    `⭐ <b>ستاره:</b> <code>${g.star_count}</code>\n` +
+    `💰 <b>قیمت فعلی:</b> <code>${fmtPrice(price)}</code> تومان\n` +
+    `📝 <b>توضیحات:</b> ${g.description ? g.description : "—"}\n` +
+    `🖼️ <b>عکس:</b> ${g.image_file_id ? "✅ دارد" : "❌ ندارد"}\n\n` +
+    `${SEPARATOR}\n` +
+    `روی موردی که میخوای عوض کنی بزن:`;
+  const rows = [
+    [BTN.primary("✏️ نام", `gedit_name_${g.id}`), BTN.primary("⭐ ستاره", `gedit_star_${g.id}`)],
+    [BTN.primary("😀 ایموجی", `gedit_emoji_${g.id}`), BTN.primary("📝 توضیحات", `gedit_desc_${g.id}`)],
+    [BTN.primary("🖼️ ست کردن عکس", `gedit_img_${g.id}`)],
+  ];
+  if (g.image_file_id) rows.push([BTN.danger("🗑 حذف عکس فعلی", `gedit_imgdel_${g.id}`)]);
+  rows.push([BTN.primary(g.is_active ? "🔴 غیرفعال کن" : "🟢 فعال کن", `gedit_toggle_${g.id}`)]);
+  rows.push([BTN.danger("🗑 حذف گیفت", `gedit_del_${g.id}`)]);
+  rows.push([BTN.neutral("🔙 بازگشت به لیست گیفت‌ها", "admin_gifts")]);
+  const kb = { reply_markup: { inline_keyboard: rows } };
+  if (msgId) await editSmart(chatId, msgId, text, kb); else await send(chatId, text, kb);
 }
 
 // ==================== Main Menu ====================
@@ -664,6 +785,13 @@ async function handleMessage(msg) {
     dbRun(`UPDATE gifts SET image_file_id='${fid}' WHERE id=${gid}`);
     await send(chatId, `✅ عکس گیفت ${gid} ست شد.`);
     return;
+  }
+
+  // Admin: Test error tracker
+  if (text === "/errtest") {
+    if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید.");
+    console.error("🧪 تست ارور-ترکر: این یک خطای آزمایشی است.");
+    return send(chatId, "✅ خطای آزمایشی چاپ شد — گزارش باید به همه ادمین‌ها برسد.");
   }
 
   // Admin: Add gift step-by-step
@@ -1197,6 +1325,34 @@ async function handleMessage(msg) {
     return;
   }
 
+  // Awaiting backup channel
+  if (user.admin_state === "set_awaiting_backup") {
+    if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید.");
+    if (text.startsWith("/")) {
+      dbRun(`UPDATE users SET admin_state=NULL WHERE telegram_id=${tgId}`);
+      if (text !== "/cancel") await send(chatId, "تنظیم کانال بکاپ لغو شد.");
+      return;
+    }
+    const input = text.trim();
+    let channelId, channelName;
+    if (input.startsWith("@")) {
+      const c = await api("getChat", { chat_id: input });
+      if (!c.ok) return send(chatId, `❌ کانال <code>${esc(input)}</code> یافت نشد. اول بات را ادمین کانال کنید.`);
+      channelId = c.result.id; channelName = input.replace("@", "");
+    } else {
+      channelId = parseInt(input);
+      if (isNaN(channelId)) return send(chatId, "❌ آیدی نامعتبر بود. عملیات لغو شد.");
+      channelName = input;
+    }
+    // Test sending before saving
+    const t = await api("sendMessage", { chat_id: channelId, text: "✅ تست اتصال کانال بکاپ — این پیام را نادیده بگیرید." });
+    if (!t.ok) return send(chatId, "❌ بات نمی‌تواند در این کانال پیام ارسال کند. بات را ادمین با دسترسی ارسال پیام اضافه کنید و دوباره امتحان کنید.");
+    setSetting("backup_channel", String(channelId));
+    await send(chatId, `✅ <b>کانال بکاپ ذخیره شد:</b> ${channelName} (<code>${channelId}</code>)\n📦 اولین بکاپ همین الان ارسال میشود؛ بعدی هر ۵ ساعت.`);
+    await sendDbBackup(chatId, false);
+    return;
+  }
+
   // Awaiting must channel add
   if (user.admin_state === "set_awaiting_must_add") {
     if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید.");
@@ -1218,6 +1374,51 @@ async function handleMessage(msg) {
     dbRun(`INSERT INTO must_channels (channel_id, channel_name) VALUES (${channelId}, '${channelName.replace(/'/g, "''")}')`);
     await send(chatId, `✅ <b>کانال الزامی اضافه شد:</b>\n${channelName || channelId}`);
     return;
+  }
+
+  // ===== Gift edit input states (gedit_*) =====
+  if (freshUser.admin_state && freshUser.admin_state.startsWith("gedit_")) {
+    if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید.");
+    const field = freshUser.admin_state.slice(6);
+    const [gidS, msgS] = String(freshUser.admin_state_data || "").split("|");
+    const gid = parseInt(gidS), cardMsgId = parseInt(msgS);
+    const g = dbGet(`SELECT * FROM gifts WHERE id=${gid}`);
+    const clear = () => dbRun(`UPDATE users SET admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`);
+    if (!g) { clear(); return send(chatId, "⚠️ گیفت حذف شده — ویرایش لغو شد."); }
+    if (text.startsWith("/")) {
+      clear();
+      await send(chatId, "↩️ ویرایش لغو شد.");
+      return giftEditCard(chatId, cardMsgId, gid);
+    }
+    let note = "";
+    if (field === "name") {
+      const v = text.trim().replace(/\|/g, "").slice(0, 100);
+      if (!v) return send(chatId, "❌ اسم خالی بود — دوباره بفرستید یا /cancel بزنید.");
+      dbRun(`UPDATE gifts SET name='${v.replace(/'/g, "''")}' WHERE id=${gid}`);
+    } else if (field === "star") {
+      const v = parseNum(normalizeDigits(text));
+      if (!v || v <= 0) return send(chatId, "❌ عدد نامعتبر — دوباره بفرستید یا /cancel بزنید.");
+      dbRun(`UPDATE gifts SET star_count=${v} WHERE id=${gid}`);
+      note = `\n💰 قیمت جدید: <code>${fmtPrice(v * getNumSetting("exchange_rate"))}</code> تومان`;
+    } else if (field === "emoji") {
+      const v = extractEmoji(text) || "🎁";
+      dbRun(`UPDATE gifts SET emoji='${v.replace(/'/g, "''")}' WHERE id=${gid}`);
+    } else if (field === "desc") {
+      const raw = text.trim().replace(/\|/g, "");
+      if (raw === "-") dbRun(`UPDATE gifts SET description=NULL WHERE id=${gid}`);
+      else {
+        const v = raw.replace(/</g, "&lt;").replace(/>/g, "&gt;").slice(0, 500);
+        dbRun(`UPDATE gifts SET description='${v.replace(/'/g, "''")}' WHERE id=${gid}`);
+      }
+    } else if (field === "img") {
+      if (!msg.photo) return send(chatId, "🖼️ لطفاً خود <b>عکس</b> رو بفرستید (نه متن). یا /cancel بزنید.");
+      const fid = msg.photo[msg.photo.length - 1].file_id;
+      dbRun(`UPDATE gifts SET image_file_id='${fid}' WHERE id=${gid}`);
+      note = "\n🖼️ عکس ست شد.";
+    }
+    clear();
+    await send(chatId, `✅ <b>ذخیره شد.</b>${note}`);
+    return giftEditCard(chatId, cardMsgId, gid);
   }
 
   // /start
@@ -1742,22 +1943,13 @@ async function handleCallback(cq) {
     const gifts = dbAll("SELECT * FROM gifts ORDER BY sort_order ASC");
     let text = `🎁 <b>مدیریت گیفت‌ها</b>\n${SEPARATOR}\n\n`;
     if (gifts.length) {
-      for (const g of gifts) {
-        const st = g.is_active ? "🟢" : "🔴";
-        text += `${st} <code>${g.id}</code> ${g.emoji} <b>${g.name}</b> — ⭐${g.star_count}\n`;
-      }
-    } else {
-      text += `📭 گیفتی وجود ندارد.\n`;
-    }
-    text += `\n${SEPARATOR}\n`;
-    text += `📝 <b>دستورات:</b>\n`;
-    text += `<code>/addgift</code> — اضافه کردن (مرحله‌ای)\n`;
-    text += `<code>/delgift [ID]</code> — حذف\n`;
-    text += `<code>/tgift [ID]</code> — فعال/غیرفعال`;
-    await send(chatId, text, { reply_markup: { inline_keyboard: [
-      [BTN.success("🎁 اضافه کردن گیفت جدید", "admin_addgift")],
-      [BTN.neutral("🔙 بازگشت", "admin_back")],
-    ]}});
+      for (const g of gifts) text += `${g.is_active ? "🟢" : "🔴"} <code>${g.id}</code> ${g.emoji} <b>${g.name}</b> — ⭐${g.star_count}\n`;
+      text += `\n👇 برای ویرایش روی گیفت بزنید:`;
+    } else text += `📭 گیفتی وجود ندارد.\n`;
+    const rows = gifts.map(g => [BTN.primary(`${g.is_active ? "🟢" : "🔴"} ${g.emoji} ${g.name} — ⭐${g.star_count}`, `gedit_${g.id}`)]);
+    rows.push([BTN.success("🎁 اضافه کردن گیفت جدید", "admin_addgift")]);
+    rows.push([BTN.neutral("🔙 بازگشت", "admin_back")]);
+    await editSmart(chatId, msgId, text, { reply_markup: { inline_keyboard: rows } });
     return answer(cq.id);
   }
 
@@ -1821,6 +2013,82 @@ async function handleCallback(cq) {
       await edit(chatId, msgId, `✅ <b>گیفت ذخیره شد!</b>\n\n${emoji} <b>${giftName}</b> — ⭐ ${starCount} — 💰 ${fmtPrice(price)} تومان`,
         { reply_markup: { inline_keyboard: [[BTN.success("🎁 اضافه کردن گیفت جدید", "admin_addgift")], [{ text: "🔙 بازگشت به منو", callback_data: "admin_back" }]] } }
       );
+    }
+    return answer(cq.id);
+  }
+
+  // ===== Gift edit (gedit_) =====
+  if (data.startsWith("gedit_")) {
+    if (!isAdmin(tgId)) return answer(cq.id);
+    const rest = data.slice(6);
+    // Open gift card + clear any partial edit state
+    if (/^\d+$/.test(rest)) {
+      dbRun(`UPDATE users SET admin_state=NULL, admin_state_data=NULL WHERE telegram_id=${tgId} AND admin_state LIKE 'gedit_%'`);
+      await giftEditCard(chatId, msgId, parseInt(rest));
+      return answer(cq.id);
+    }
+    // Final delete
+    if (rest.startsWith("delok_")) {
+      const gid = parseInt(rest.slice(6));
+      dbRun(`DELETE FROM gifts WHERE id=${gid}`);
+      const gifts = dbAll("SELECT * FROM gifts ORDER BY sort_order ASC");
+      let t2 = `🎁 <b>مدیریت گیفت‌ها</b>\n${SEPARATOR}\n\n`;
+      if (gifts.length) { for (const x of gifts) t2 += `${x.is_active ? "🟢" : "🔴"} <code>${x.id}</code> ${x.emoji} <b>${x.name}</b> — ⭐${x.star_count}\n`; t2 += `\n👇 برای ویرایش روی گیفت بزنید:`; }
+      else t2 += `📭 گیفتی وجود ندارد.`;
+      const rows2 = gifts.map(x => [BTN.primary(`${x.is_active ? "🟢" : "🔴"} ${x.emoji} ${x.name} — ⭐${x.star_count}`, `gedit_${x.id}`)]);
+      rows2.push([BTN.success("🎁 اضافه کردن گیفت جدید", "admin_addgift")]);
+      rows2.push([BTN.neutral("🔙 بازگشت", "admin_back")]);
+      await editSmart(chatId, msgId, t2, { reply_markup: { inline_keyboard: rows2 } });
+      return answer(cq.id, "حذف شد ✅");
+    }
+    // Confirm delete
+    if (rest.startsWith("del_")) {
+      const gid = parseInt(rest.slice(4));
+      const g = dbGet(`SELECT * FROM gifts WHERE id=${gid}`);
+      if (!g) return answer(cq.id, "یافت نشد.", true);
+      await editSmart(chatId, msgId,
+        `🗑 <b>حذف گیفت</b>\n${SEPARATOR}\n\n${g.emoji} <b>${g.name}</b> — ⭐${g.star_count}\n\n❗️ این عملیات برگشت‌پذیر نیست.`,
+        { reply_markup: { inline_keyboard: [
+          [BTN.danger("✅ بله، حذف کن", `gedit_delok_${gid}`)],
+          [BTN.neutral("🔙 انصراف", `gedit_${gid}`)],
+        ]}});
+      return answer(cq.id);
+    }
+    // Toggle active/inactive
+    if (rest.startsWith("toggle_")) {
+      const gid = parseInt(rest.slice(7));
+      const g = dbGet(`SELECT * FROM gifts WHERE id=${gid}`);
+      if (!g) return answer(cq.id, "یافت نشد.", true);
+      dbRun(`UPDATE gifts SET is_active=${g.is_active ? 0 : 1} WHERE id=${gid}`);
+      await giftEditCard(chatId, msgId, gid);
+      return answer(cq.id, g.is_active ? "غیرفعال شد 🔴" : "فعال شد 🟢");
+    }
+    // Delete image
+    if (rest.startsWith("imgdel_")) {
+      const gid = parseInt(rest.slice(7));
+      dbRun(`UPDATE gifts SET image_file_id=NULL WHERE id=${gid}`);
+      await giftEditCard(chatId, msgId, gid);
+      return answer(cq.id, "عکس حذف شد");
+    }
+    // Set text field
+    const m = rest.match(/^(name|star|emoji|desc|img)_(\d+)$/);
+    if (m) {
+      const field = m[1], gid = parseInt(m[2]);
+      const g = dbGet(`SELECT * FROM gifts WHERE id=${gid}`);
+      if (!g) return answer(cq.id, "یافت نشد.", true);
+      dbRun(`UPDATE users SET admin_state='gedit_${field}', admin_state_data='${gid}|${msgId}', updated_at=unixepoch() WHERE telegram_id=${tgId}`);
+      const prompts = {
+        name: "✏️ <b>نام جدید</b> گیفت رو بنویسید:\n(تا ۱۰۰ حرف)",
+        star: "⭐ <b>تعداد ستاره جدید</b> رو بنویسید (فقط عدد).\nقیمت خودکار = ستاره × نرخ تبدیل",
+        emoji: "😀 <b>ایموجی جدید</b> رو بفرستید:\n(مثال: 🎁)",
+        desc: "📝 <b>توضیحات جدید</b> رو بفرستید (تا ۵۰۰ حرف).\nبرای حذف کامل توضیحات فقط <code>-</code> بفرستید.",
+        img: "🖼️ <b>عکس جدید گیفت رو همین‌جا ارسال کنید.</b>\n(به‌جای عکس فعلی ست میشه)",
+      };
+      await editSmart(chatId, msgId,
+        `🎁 <b>ویرایش گیفت:</b> ${g.emoji} ${esc(g.name)}\n${SEPARATOR}\n\n${prompts[field]}`,
+        { reply_markup: { inline_keyboard: [[BTN.danger("❌ انصراف", `gedit_${gid}`)]] } }
+      );
+      return answer(cq.id);
     }
     return answer(cq.id);
   }
@@ -2067,6 +2335,30 @@ async function handleCallback(cq) {
       { reply_markup: { inline_keyboard: [[BTN.danger("❌ انصراف", "admin_settings")]] } }
     );
     return answer(cq.id);
+  }
+
+  // Edit backup channel
+  if (data === "set_edit_backup") {
+    if (!isAdmin(tgId)) return answer(cq.id);
+    const bk = getSetting("backup_channel");
+    dbRun(`UPDATE users SET admin_state='set_awaiting_backup', updated_at=unixepoch() WHERE telegram_id=${tgId}`);
+    await send(chatId,
+      `📦 <b>تغییر کانال بکاپ</b>\n${SEPARATOR}\n\n` +
+      `کانال فعلی: ${bk ? `<code>${esc(bk)}</code>` : "❌ تنظیم نشده"}\n\n` +
+      `📝 آیدی یا یوزرنیم کانال جدید رو بفرستید:\n(مثال: <code>@pepestar_backups</code> یا <code>-1001234567890</code>)\n\n` +
+      `📌 ربات رو به‌عنوان ادمین با قابلیت ارسال پیام در کانال اضافه کنید.\n` +
+      `🕒 بعد از تنظیم، هر ۵ ساعت فایل کامل دیتابیس به این کانال ارسال میشه.`,
+      { reply_markup: { inline_keyboard: [[BTN.danger("❌ انصراف", "admin_settings")]] } }
+    );
+    return answer(cq.id);
+  }
+
+  // Manual backup now
+  if (data === "backup_now") {
+    if (!isAdmin(tgId)) return answer(cq.id);
+    const ok = await sendDbBackup(chatId, false);
+    await answer(cq.id, ok ? "بکاپ گرفته شد ✅" : "بکاپ ناموفق ❌");
+    return;
   }
 
   // Edit must-join channels
@@ -2338,8 +2630,6 @@ async function handleCallback(cq) {
         console.log("⚠️ No log channel configured");
       }
     } catch (e) { console.error("Log channel error:", e.message); }
-    // Delete completed order from database
-    dbRun(`DELETE FROM orders WHERE id=${oId}`);
     return answer(cq.id, "تکمیل شد.");
   }
 
@@ -2377,11 +2667,17 @@ async function main() {
   console.log(`🤖 ${BOT_NAME} Bot starting...`);
   console.log(`📦 دیتابیس: ${DB_PATH}`);
   console.log(`🎁 گیفتها: ${dbGet("SELECT COUNT(*) AS c FROM gifts")?.c ?? 0}`);
+  if (process.env.RAILWAY_ENVIRONMENT && !DB_PATH.replace(/\\/g, "/").startsWith("/data/")) {
+    console.error(`⚠️⚠️⚠️ خطر: DB_PATH خارج از /data است (${DB_PATH}) — با هر دیپلوی دیتا پاک میشود! Variable را DB_PATH=/data/bot.db کنید.`);
+  }
+  console.log(`📊 سفارشات: ${dbGet("SELECT COUNT(*) AS c FROM orders")?.c ?? 0} — کاربران: ${dbGet("SELECT COUNT(*) AS c FROM users")?.c ?? 0}`);
   const me = await api("getMe");
   if (!me.ok) { console.error("❌ Cannot connect:", me.description); process.exit(1); }
   console.log(`✅ Bot: @${me.result.username}`);
   await api("deleteWebhook");
   console.log("🔄 Polling started! Send /start to your bot.");
   poll();
+  setTimeout(scheduledBackup, 60 * 1000);
+  setInterval(scheduledBackup, 5 * 60 * 60 * 1000);
 }
 main();
