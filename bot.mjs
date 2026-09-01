@@ -91,6 +91,14 @@ try { dbRun("SELECT gift_id FROM gifts LIMIT 1"); } catch { dbRun("ALTER TABLE g
 try { dbRun("SELECT description FROM gifts LIMIT 1"); } catch { dbRun("ALTER TABLE gifts ADD COLUMN description TEXT"); }
 try { dbRun("SELECT image_file_id FROM gifts LIMIT 1"); } catch { dbRun("ALTER TABLE gifts ADD COLUMN image_file_id TEXT"); }
 
+// Add fake column to orders (for stats exclusion)
+try { dbRun("SELECT fake FROM orders LIMIT 1"); } catch { dbRun("ALTER TABLE orders ADD COLUMN fake INTEGER DEFAULT 0"); }
+
+// App flags table (for stats epoch etc.)
+dbRun(`CREATE TABLE IF NOT EXISTS app_flags (key TEXT PRIMARY KEY, value TEXT)`);
+function getStatsEpoch() { const r = dbGet(`SELECT value FROM app_flags WHERE key='stats_epoch'`); return r ? Number(r.value) : 0; }
+function setStatsEpoch(ms) { const v = String(ms); const ex = dbGet(`SELECT * FROM app_flags WHERE key='stats_epoch'`); if (ex) dbRun(`UPDATE app_flags SET value='${v}' WHERE key='stats_epoch'`); else dbRun(`INSERT INTO app_flags (key, value) VALUES ('stats_epoch', '${v}')`); saveDb(); }
+
 // Seed default gifts if empty
 const giftCount = dbGet("SELECT COUNT(*) as c FROM gifts")?.c || 0;
 if (giftCount === 0) {
@@ -118,6 +126,8 @@ if (giftCount === 0) {
 function genCode() { const c = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; let r = ""; for (let i = 0; i < 6; i++) r += c[Math.floor(Math.random() * c.length)]; return r; }
 function fmtPrice(p) { return p.toLocaleString("fa-IR"); }
 function isAdmin(id) { return ADMIN_IDS.includes(id); }
+const toMs = v => { if (v == null) return 0; if (typeof v === 'number') return v < 1e12 ? v * 1000 : v; const t = Date.parse(v); return Number.isFinite(t) ? t : 0; };
+function isStatExcluded(order) { return (order.fake === 1) || ADMIN_IDS.includes(Number(order.user_id)); }
 function parseGiftLink(t) { for (const p of [/t\.me\/nft\/([^\s?]+)/, /telegram\.me\/nft\/([^\s?]+)/, /tg:\/\/nft\?slug=([^\s&]+)/]) { const m = t.match(p); if (m) return m[1]; } return null; }
 function maskId(id) { const s = id.toString(); return s.length > 8 ? s.substring(0, 4) + "******" : s.substring(0, Math.ceil(s.length / 2)) + "****"; }
 function parseNum(s) { return parseInt(String(s).replace(/[^\d]/g, "")); }
@@ -199,6 +209,7 @@ async function renderOrderDetail(chatId, oId, msgId = null, fromStatus = null) {
     `🔍 <b>جزئیات سفارش</b>\n${SEPARATOR}\n\n` +
     `🔑 <b>کد:</b> <code>${o.code}</code>\n` +
     `📊 <b>وضعیت:</b> ${SL[o.status] || o.status}\n` +
+    (o.fake ? `⚠️ <b>فیک — خارج از آمار</b>\n` : "") +
     `📦 <b>نوع:</b> ${TL[o.type] || o.type || "—"}\n` +
     `⭐ <b>تعداد:</b> ${o.star_count ?? "—"}\n` +
     `💰 <b>مبلغ:</b> ${fmtPrice(o.price_toman)} تومان\n`;
@@ -218,6 +229,7 @@ async function renderOrderDetail(chatId, oId, msgId = null, fromStatus = null) {
     rows.push(btnRow(BTN.success("✅ تکمیل", `complete_${o.id}`), BTN.danger("🚫 لغو", `cancel_${o.id}`)));
   else if (o.status === "cancelled")
     rows.push(btnRow(BTN.primary("♻️ بازگردانی به «تایید شده»", `restore_${o.id}`)));
+  rows.push([BTN.danger(o.fake ? "⚠️ فیک — خارج از آمار ✓" : "🏷️ علامت‌گذاری فیک", `toggle_fake_${o.id}`)]);
   rows.push([BTN.neutral("🔙 بازگشت", fromStatus ? `adm_page_${fromStatus}_0` : "admin_back")]);
 
   const kb = { reply_markup: { inline_keyboard: rows } };
@@ -662,31 +674,34 @@ async function statsRender(chatId, msgId, period) {
   const UCOL = "user_id";     // ستون خریدار در جدول orders
 
   const b = statsBounds(period);
-  const wh = (cond) => (b ? `WHERE ${TCOL} >= ${b} AND ${cond}` : `WHERE ${cond}`);
-  const W = b ? `WHERE ${TCOL} >= ${b}` : "";
+  const EPOCH = getStatsEpoch();
+  const ADMIN_EXCL = ADMIN_IDS.length ? `AND user_id NOT IN (${ADMIN_IDS.join(",")})` : "";
+  const FAKE_EXCL = "AND COALESCE(fake, 0) = 0";
+  const TIME_EXCL = b ? `AND ${TCOL} >= ${b}` : "";
+  const EPOCH_EXCL = EPOCH ? `AND (${TCOL} * (CASE WHEN ${TCOL} < 1e12 THEN 1000 ELSE 1} END) >= ${EPOCH}` : "";
 
   // --- کاربران
   const uTotal = dbGet(`SELECT COUNT(*) c FROM users`)?.c ?? 0;
   const uNew = b ? (dbGet(`SELECT COUNT(*) c FROM users WHERE created_at >= ${b}`)?.c ?? 0) : uTotal;
-  const uBuyers = dbGet(`SELECT COUNT(DISTINCT ${UCOL}) c FROM orders ${W}`)?.c ?? 0;
+  const uBuyers = dbGet(`SELECT COUNT(DISTINCT ${UCOL}) c FROM orders WHERE 1=1 ${FAKE_EXCL} ${ADMIN_EXCL} ${TIME_EXCL} ${EPOCH_EXCL}`)?.c ?? 0;
 
   // --- سفارش‌ها به تفکیک وضعیت
-  const rows = dbAll(`SELECT status, COUNT(*) c FROM orders ${W} GROUP BY status`);
+  const statusRows = dbAll(`SELECT status, COUNT(*) c FROM orders WHERE 1=1 ${FAKE_EXCL} ${ADMIN_EXCL} ${TIME_EXCL} ${EPOCH_EXCL} GROUP BY status`);
   const smap = {}; let oTotal = 0;
-  for (const r of rows) { smap[r.status] = r.c; oTotal += r.c; }
+  for (const r of statusRows) { smap[r.status] = r.c; oTotal += r.c; }
   const sget = (k) => smap[k] ?? 0;
   const rate = oTotal ? Math.round((sget("completed") / oTotal) * 100) : 0;
 
   // --- مالی
-  const revDone  = dbGet(`SELECT COALESCE(SUM(${PCOL}),0) s FROM orders ${wh("status='completed'")}`)?.s ?? 0;
-  const revPend  = dbGet(`SELECT COALESCE(SUM(${PCOL}),0) s FROM orders ${wh("status IN ('pending','pending_approval','approved','receipt_sent')")}`)?.s ?? 0;
+  const revDone  = dbGet(`SELECT COALESCE(SUM(${PCOL}),0) s FROM orders WHERE status='completed' ${FAKE_EXCL} ${ADMIN_EXCL} ${TIME_EXCL} ${EPOCH_EXCL}`)?.s ?? 0;
+  const revPend  = dbGet(`SELECT COALESCE(SUM(${PCOL}),0) s FROM orders WHERE status IN ('pending','pending_approval','approved','receipt_sent') ${FAKE_EXCL} ${ADMIN_EXCL} ${TIME_EXCL} ${EPOCH_EXCL}`)?.s ?? 0;
   const avgOrder = sget("completed") ? Math.round(revDone / sget("completed")) : 0;
 
   // --- پرفروش‌ترین‌ها (گروپ با gift_name چون gift_id در اسکیما نیست)
   const top = dbAll(`SELECT gift_name nm, COUNT(*) c
-    FROM orders o
-    WHERE o.status IN ('approved','completed') ${b ? `AND o.${TCOL} >= ${b}` : ""}
-    GROUP BY o.gift_name ORDER BY c DESC LIMIT 5`);
+    FROM orders
+    WHERE status IN ('approved','completed') ${FAKE_EXCL} ${ADMIN_EXCL} ${TIME_EXCL} ${EPOCH_EXCL}
+    GROUP BY gift_name ORDER BY c DESC LIMIT 5`);
   let topTxt = "";
   if (top.length) for (let i = 0; i < top.length; i++) topTxt += `${i + 1}. ${esc(top[i].nm || "—")} — <b>${top[i].c}</b> فروش\n`;
   else topTxt = "—\n";
@@ -892,6 +907,29 @@ async function handleMessage(msg) {
     if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید.");
     console.error("🧪 تست ارور-ترکر: این یک خطای آزمایشی است.");
     return send(chatId, "✅ خطای آزمایشی چاپ شد — گزارش باید به همه ادمین‌ها برسد.");
+  }
+
+  // Admin: Pack stats (exclude old data from stats)
+  if (text === "/packstats") {
+    if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید.");
+    const cur = getStatsEpoch();
+    if (text.endsWith(" off")) {
+      setStatsEpoch(0);
+      await send(chatId, "✅ آمار ریست شد — همه داده‌ها دوباره وارد آمار می‌شوند.");
+      return;
+    }
+    await send(chatId,
+      `📦 <b>پک آمار</b>\n${SEPARATOR}\n\n` +
+      (cur ? `⏰.epoch فعلی: ${toJalali(new Date(cur))}\n\n` : "") +
+      `با پک کردن، سفارش‌های قبلی از آمار حذف می‌شوند (فقط شمرده نمیشوند — خود سفارش‌ها حفظ می‌شوند).\n\n` +
+      `از این لحظه فقط سفارش‌های جدید (غیرفیک، غیرادمین) شمرده میشوند.\n\n` +
+      `آیا مطمئن هستید؟`,
+      { reply_markup: { inline_keyboard: [
+        [BTN.danger("✅ پک کن", "pack_ok")],
+        [BTN.neutral("❌ انصراف", "pack_no")],
+      ]}}
+    );
+    return;
   }
 
   // Admin: Add gift step-by-step
@@ -2813,6 +2851,37 @@ async function handleCallback(cq) {
     if (!["today", "week", "month", "all"].includes(p)) return answer(cq.id);
     if (!isAdmin(tgId)) return answer(cq.id);
     await statsRender(chatId, msgId, p);
+    return answer(cq.id);
+  }
+
+  // ==================== TOGGLE FAKE ====================
+  if (data.startsWith("toggle_fake_")) {
+    if (!isAdmin(tgId)) return answer(cq.id);
+    const oId = parseInt(data.replace("toggle_fake_", ""));
+    const o = dbGet(`SELECT * FROM orders WHERE id=${oId}`);
+    if (!o) return answer(cq.id, "سفارش یافت نشد.", true);
+    const newFake = o.fake ? 0 : 1;
+    dbRun(`UPDATE orders SET fake=${newFake}, updated_at=unixepoch() WHERE id=${oId}`);
+    await answer(cq.id, newFake ? "⚠️ فیک — خارج از آمار" : "🏷️ از فیک خارج شد");
+    await renderOrderDetail(chatId, oId, msgId, null);
+    return;
+  }
+
+  // ==================== PACK STATS ====================
+  if (data === "pack_ok") {
+    if (!isAdmin(tgId)) return answer(cq.id);
+    setStatsEpoch(Date.now());
+    await editSmart(chatId, msgId,
+      `✅ <b>آمار پک شد.</b>\n\n` +
+      `از این لحظه فقط سفارش‌های جدید (غیرفیک، غیرادمین) شمرده میشوند.\n` +
+      `داده‌های قبلی حذف نشدند — فقط از آمار خارج شدند.`
+    );
+    await answer(cq.id, "آمار پک شد ✅");
+    return;
+  }
+  if (data === "pack_no") {
+    if (!isAdmin(tgId)) return answer(cq.id);
+    await editSmart(chatId, msgId, `❌ <b>پک آمار لغو شد.</b>`);
     return answer(cq.id);
   }
 
