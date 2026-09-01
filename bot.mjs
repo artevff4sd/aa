@@ -656,15 +656,19 @@ function statsBounds(period) {
 }
 
 async function statsRender(chatId, msgId, period) {
+  // ⚠️ ستون‌های واقعی اسکیمای orders — بدون این، کوئریها کرش میکنند
+  const TCOL = "created_at";  // ستون زمان ثبت سفارش
+  const PCOL = "price_toman"; // ستون قیمت سفارش
+  const UCOL = "user_id";     // ستون خریدار در جدول orders
+
   const b = statsBounds(period);
-  const wh = (cond) => (b ? `WHERE created_at >= ${b} AND ${cond}` : `WHERE ${cond}`);
-  const W = b ? `WHERE created_at >= ${b}` : "";
-  const PCOL = "price_toman"; // ⚠️ چک اسکیما — ستون قیمت در orders
+  const wh = (cond) => (b ? `WHERE ${TCOL} >= ${b} AND ${cond}` : `WHERE ${cond}`);
+  const W = b ? `WHERE ${TCOL} >= ${b}` : "";
 
   // --- کاربران
   const uTotal = dbGet(`SELECT COUNT(*) c FROM users`)?.c ?? 0;
   const uNew = b ? (dbGet(`SELECT COUNT(*) c FROM users WHERE created_at >= ${b}`)?.c ?? 0) : uTotal;
-  const uBuyers = dbGet(`SELECT COUNT(DISTINCT telegram_id) c FROM orders ${W}`)?.c ?? 0;
+  const uBuyers = dbGet(`SELECT COUNT(DISTINCT ${UCOL}) c FROM orders ${W}`)?.c ?? 0;
 
   // --- سفارش‌ها به تفکیک وضعیت
   const rows = dbAll(`SELECT status, COUNT(*) c FROM orders ${W} GROUP BY status`);
@@ -681,7 +685,7 @@ async function statsRender(chatId, msgId, period) {
   // --- پرفروش‌ترین‌ها (گروپ با gift_name چون gift_id در اسکیما نیست)
   const top = dbAll(`SELECT gift_name nm, COUNT(*) c
     FROM orders o
-    ${wh("o.status IN ('approved','completed')")}
+    WHERE o.status IN ('approved','completed') ${b ? `AND o.${TCOL} >= ${b}` : ""}
     GROUP BY o.gift_name ORDER BY c DESC LIMIT 5`);
   let topTxt = "";
   if (top.length) for (let i = 0; i < top.length; i++) topTxt += `${i + 1}. ${esc(top[i].nm || "—")} — <b>${top[i].c}</b> فروش\n`;
