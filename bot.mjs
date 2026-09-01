@@ -423,6 +423,7 @@ async function adminMenu(chatId) {
       btnRow(BTN.primary(`📦 تکمیل سفارشات  [${a}]`, "admin_complete_list")),
       btnRow(BTN.primary("🎁 مدیریت گیفت‌ها", "admin_gifts")),
       btnRow(BTN.primary("⚙️ تنظیمات", "admin_settings")),
+      btnRow(BTN.primary("📊 آمار", "admin_stats")),
       btnRow(BTN.primary("📢 ارسال پیام همگانی", "admin_broadcast")),
       btnRow(BTN.info("📋 گزارش فیک", "admin_fake_report")),
       btnRow(BTN.primary("🔎 جستجوی سفارش", "admin_search")),
@@ -520,6 +521,7 @@ async function sendDbBackup(targetChatId, isAuto = false) {
     const r = await fetch(`${API}/sendDocument`, { method: "POST", body: fd });
     const j = await r.json();
     if (!j.ok) { console.error("❌ Backup send failed:", j.description); if (!isAuto) await send(targetChatId, "❌ ارسال بکاپ ناموفق: " + (j.description || "")); return false; }
+    setSetting("last_backup_at", String(Math.floor(Date.now() / 1000)));
     console.log(`✅ DB backup sent (${isAuto ? "auto" : "manual"})`);
     return true;
   } catch (e) { console.error("❌ Backup error:", e.message); if (!isAuto) await send(targetChatId, "❌ خطا در بکاپ: " + e.message); return false; }
@@ -640,6 +642,87 @@ async function giftEditCard(chatId, msgId, gid) {
   rows.push([BTN.danger("🗑 حذف گیفت", `gedit_del_${g.id}`)]);
   rows.push([BTN.neutral("🔙 بازگشت به لیست گیفت‌ها", "admin_gifts")]);
   const kb = { reply_markup: { inline_keyboard: rows } };
+  if (msgId) await editSmart(chatId, msgId, text, kb); else await send(chatId, text, kb);
+}
+
+// ==================== Admin Stats ====================
+const STATS_TZ = 3.5 * 3600; // نیمه‌شب به وقت تهران
+const STATS_LABELS = { today: "امروز", week: "۷ روز اخیر", month: "۳۰ روز اخیر", all: "کل تاریخ" };
+
+function statsBounds(period) {
+  const now = Math.floor(Date.now() / 1000);
+  const dayStart = Math.floor((now + STATS_TZ) / 86400) * 86400 - STATS_TZ;
+  return { today: dayStart, week: now - 7 * 86400, month: now - 30 * 86400, all: 0 }[period];
+}
+
+async function statsRender(chatId, msgId, period) {
+  const b = statsBounds(period);
+  const wh = (cond) => (b ? `WHERE created_at >= ${b} AND ${cond}` : `WHERE ${cond}`);
+  const W = b ? `WHERE created_at >= ${b}` : "";
+  const PCOL = "price_toman"; // ⚠️ چک اسکیما — ستون قیمت در orders
+
+  // --- کاربران
+  const uTotal = dbGet(`SELECT COUNT(*) c FROM users`)?.c ?? 0;
+  const uNew = b ? (dbGet(`SELECT COUNT(*) c FROM users WHERE created_at >= ${b}`)?.c ?? 0) : uTotal;
+  const uBuyers = dbGet(`SELECT COUNT(DISTINCT telegram_id) c FROM orders ${W}`)?.c ?? 0;
+
+  // --- سفارش‌ها به تفکیک وضعیت
+  const rows = dbAll(`SELECT status, COUNT(*) c FROM orders ${W} GROUP BY status`);
+  const smap = {}; let oTotal = 0;
+  for (const r of rows) { smap[r.status] = r.c; oTotal += r.c; }
+  const sget = (k) => smap[k] ?? 0;
+  const rate = oTotal ? Math.round((sget("completed") / oTotal) * 100) : 0;
+
+  // --- مالی
+  const revDone  = dbGet(`SELECT COALESCE(SUM(${PCOL}),0) s FROM orders ${wh("status='completed'")}`)?.s ?? 0;
+  const revPend  = dbGet(`SELECT COALESCE(SUM(${PCOL}),0) s FROM orders ${wh("status IN ('pending','pending_approval','approved','receipt_sent')")}`)?.s ?? 0;
+  const avgOrder = sget("completed") ? Math.round(revDone / sget("completed")) : 0;
+
+  // --- پرفروش‌ترین‌ها (گروپ با gift_name چون gift_id در اسکیما نیست)
+  const top = dbAll(`SELECT gift_name nm, COUNT(*) c
+    FROM orders o
+    ${wh("o.status IN ('approved','completed')")}
+    GROUP BY o.gift_name ORDER BY c DESC LIMIT 5`);
+  let topTxt = "";
+  if (top.length) for (let i = 0; i < top.length; i++) topTxt += `${i + 1}. ${esc(top[i].nm || "—")} — <b>${top[i].c}</b> فروش\n`;
+  else topTxt = "—\n";
+
+  // --- سیستم
+  const up = process.uptime();
+  const upTxt = up >= 3600 ? `${Math.floor(up / 3600)} ساعت و ${Math.floor((up % 3600) / 60)} دقیقه` : `${Math.floor(up / 60)} دقیقه`;
+  let dbSize = "?";
+  try { const s = fs.statSync(DB_PATH).size; dbSize = s >= 1048576 ? (s / 1048576).toFixed(1) + " MB" : Math.round(s / 1024) + " KB"; } catch {}
+  const lb = Number(getSetting("last_backup_at") || 0);
+  const backupTxt = getSetting("backup_channel")
+    ? `✅ ست شده${lb ? ` — آخرین: ${toJalali(new Date(lb * 1000))}` : ""}`
+    : "❌ تنظیم نشده";
+
+  const text =
+    `📊 <b>آمار ربات</b> — ${STATS_LABELS[period]}\n${SEPARATOR}\n\n` +
+    `👥 <b>کاربران</b>\n` +
+    `• کل: <b>${uTotal}</b> — عضو این بازه: <b>+${uNew}</b>\n` +
+    `• خرید کرده: <b>${uBuyers}</b>\n\n` +
+    `📋 <b>سفارش‌ها</b> (${oTotal} عدد)\n` +
+    `• ✅ تکمیل: ${sget("completed")} — 🟢 تایید: ${sget("approved")}\n` +
+    `• ⏳ در انتظار پرداخت: ${sget("pending")} — ❌ لغو: ${sget("cancelled")}\n` +
+    `• نرخ تکمیل: <b>%${rate}</b>\n\n` +
+    `💰 <b>مالی</b>\n` +
+    `• فروش موفق: <b>${fmtPrice(revDone)}</b> تومان\n` +
+    `• در جریان (تایید + انتظار): ${fmtPrice(revPend)} تومان\n` +
+    `• میانگین سفارش موفق: ${fmtPrice(avgOrder)} تومان\n\n` +
+    `🔥 <b>پرفروش‌ترین‌ها</b>\n${topTxt}\n` +
+    `🛠 <b>سیستم</b>\n` +
+    `• آپتایم: ${upTxt} — دیتابیس: ${dbSize}\n` +
+    `• بات: ${getSetting("bot_enabled") === "0" ? "🔴 خاموش" : "🟢 روشن"}\n` +
+    `• کانال بکاپ: ${backupTxt}`;
+
+  const mark = (p) => (period === p ? "✅" : "📅");
+  const kb = { reply_markup: { inline_keyboard: [
+    [BTN.neutral(`${mark("today")} امروز`, "stats_today"), BTN.neutral(`${mark("week")} ۷ روز`, "stats_week")],
+    [BTN.neutral(`${mark("month")} ۳۰ روز`, "stats_month"), BTN.neutral(`${mark("all")} کل`, "stats_all")],
+    [BTN.primary("🔄 بروزرسانی", `stats_${period}`)],
+    [BTN.neutral("🔙 بازگشت به پنل", "admin_back")],
+  ]}};
   if (msgId) await editSmart(chatId, msgId, text, kb); else await send(chatId, text, kb);
 }
 
@@ -1975,6 +2058,7 @@ async function handleCallback(cq) {
         btnRow(BTN.primary(`📦 تکمیل سفارشات  [${a}]`, "admin_complete_list")),
         btnRow(BTN.primary("🎁 مدیریت گیفت‌ها", "admin_gifts")),
         btnRow(BTN.primary("⚙️ تنظیمات", "admin_settings")),
+        btnRow(BTN.primary("📊 آمار", "admin_stats")),
         btnRow(BTN.primary("📢 ارسال پیام همگانی", "admin_broadcast")),
         btnRow(BTN.info("📋 گزارش فیک", "admin_fake_report")),
         btnRow(BTN.primary("🔎 جستجوی سفارش", "admin_search")),
@@ -2712,6 +2796,20 @@ async function handleCallback(cq) {
     if (u) await send(u.telegram_id, `⚫ <b>سفارش شما لغو شد.</b>\n\n🔑 کد: <code>${o.code}</code>`);
     setTimeout(() => adminMenu(chatId), 500);
     return answer(cq.id, "لغو شد.");
+  }
+
+  // ==================== STATS CALLBACKS ====================
+  if (data === "admin_stats") {
+    if (!isAdmin(tgId)) return answer(cq.id);
+    await statsRender(chatId, msgId, "today");
+    return answer(cq.id);
+  }
+  if (data.startsWith("stats_")) {
+    const p = data.slice(6);
+    if (!["today", "week", "month", "all"].includes(p)) return answer(cq.id);
+    if (!isAdmin(tgId)) return answer(cq.id);
+    await statsRender(chatId, msgId, p);
+    return answer(cq.id);
   }
 
   await answer(cq.id);
