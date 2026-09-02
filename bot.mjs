@@ -237,6 +237,24 @@ async function renderOrderDetail(chatId, oId, msgId = null, fromStatus = null) {
   else await send(chatId, text, kb);
 }
 
+// لیست سفارشات یک کاربر — برای جستجو با آیدی تلگرام یا یوزرنیم
+async function renderUserOrders(chatId, u) {
+  const rows = dbAll(`SELECT * FROM orders WHERE user_id=${u.id} ORDER BY id DESC LIMIT 10`);
+  let text =
+    `👤 <b>سفارشات کاربر</b>\n${SEPARATOR}\n\n` +
+    `🆔 <b>تلگرام:</b> <code>${u.telegram_id}</code>\n` +
+    `👥 <b>یوزرنیم:</b> ${u.username ? "@" + esc(u.username) : "ندارد"}\n`;
+  if (!rows.length) { text += `\n📭 این کاربر سفارشی ثبت نکرده.`; return send(chatId, text); }
+  text += `\n📦 <b>${rows.length} سفارش آخر:</b>\n\n`;
+  const buttons = [];
+  for (const o of rows) {
+    const si = STATUS_ICON[o.status] || "❓";
+    text += `${si} <code>${o.code}</code>  ${typeIcon(o.type)} ${o.star_count}  •  ${fmtPrice(o.price_toman)} تومان\n`;
+    buttons.push(btnRow(BTN.primary(`${si} ${o.code}`, `admin_order_${o.id}`)));
+  }
+  return send(chatId, text, { reply_markup: { inline_keyboard: buttons } });
+}
+
 // ==================== Button Color System (native Telegram style) ====================
 const BTN = {
   // style: "danger" — red background
@@ -1788,26 +1806,56 @@ async function handleMessage(msg) {
       if (text !== "/cancel") await send(chatId, "🔎 جستجو لغو شد.");
       return;
     }
-    const q = normalizeDigits(text).trim().replace(/^#/, "").toUpperCase();
+    const raw = normalizeDigits(text).trim();
+    // @username → سفارشات کاربر
+    if (raw.startsWith("@")) {
+      const uname = raw.slice(1).replace(/'/g, "''").toLowerCase();
+      const u = dbGet(`SELECT * FROM users WHERE LOWER(username)='${uname}'`);
+      if (!u) { await send(chatId, `❌ کاربری با یوزرنیم «${esc(raw)}» پیدا نشد.\nدوباره تلاش کنید یا <code>/cancel</code> بزنید.`); return; }
+      dbRun(`UPDATE users SET admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`);
+      await renderUserOrders(chatId, u);
+      return;
+    }
+    const q = raw.replace(/^#/, "").toUpperCase();
     let o = null;
     if (/^\d+$/.test(q)) o = dbGet(`SELECT * FROM orders WHERE id=${parseInt(q)}`);
     else {
       const qq = q.replace(/'/g, "''");
       o = dbGet(`SELECT * FROM orders WHERE UPPER(code)='${qq}'`);
     }
-    if (!o) { await send(chatId, `❌ سفارشی برای «${esc(q)}» پیدا نشد.\nدوباره کد رو بفرستید یا <code>/cancel</code> بزنید.`); return; }
+    // آیدی تلگرام کاربر → لیست سفارشاتش
+    if (!o && /^\d+$/.test(q)) {
+      const u = dbGet(`SELECT * FROM users WHERE telegram_id=${parseInt(q)}`);
+      if (u) {
+        dbRun(`UPDATE users SET admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`);
+        await renderUserOrders(chatId, u);
+        return;
+      }
+    }
+    if (!o) { await send(chatId, `❌ سفارشی برای «${esc(q)}» پیدا نشد.\nدوباره کد یا آیدی رو بفرستید یا <code>/cancel</code> بزنید.`); return; }
     dbRun(`UPDATE users SET admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`);
     await renderOrderDetail(chatId, o.id);
     return;
   }
 
-  // Admin: direct order lookup /order CODE
+  // Admin: direct order lookup /order CODE|ID|@username
   if (text.startsWith("/order ")) {
     if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید.");
-    const q = normalizeDigits(text.slice(7)).trim().replace(/^#/, "").toUpperCase();
-    if (!q) return send(chatId, "❌ فرمت: <code>/order QP4PGV</code>");
+    const raw = normalizeDigits(text.slice(7)).trim();
+    if (!raw) return send(chatId, "❌ فرمت: <code>/order QP4PGV</code>");
+    if (raw.startsWith("@")) {
+      const uname = raw.slice(1).replace(/'/g, "''").toLowerCase();
+      const u = dbGet(`SELECT * FROM users WHERE LOWER(username)='${uname}'`);
+      if (!u) return send(chatId, `❌ کاربری با یوزرنیم «${esc(raw)}» پیدا نشد.`);
+      return renderUserOrders(chatId, u);
+    }
+    const q = raw.replace(/^#/, "").toUpperCase();
     let o = /^\d+$/.test(q) ? dbGet(`SELECT * FROM orders WHERE id=${parseInt(q)}`)
                             : dbGet(`SELECT * FROM orders WHERE UPPER(code)='${q.replace(/'/g, "''")}'`);
+    if (!o && /^\d+$/.test(q)) {
+      const u = dbGet(`SELECT * FROM users WHERE telegram_id=${parseInt(q)}`);
+      if (u) return renderUserOrders(chatId, u);
+    }
     if (!o) return send(chatId, `❌ سفارشی برای «${esc(q)}» پیدا نشد.`);
     await renderOrderDetail(chatId, o.id);
     return;
@@ -2813,7 +2861,9 @@ async function handleCallback(cq) {
     dbRun(`UPDATE users SET admin_state='admin_search', updated_at=unixepoch() WHERE telegram_id=${tgId}`);
     await send(chatId,
       `🔎 <b>جستجوی سفارش</b>\n${SEPARATOR}\n\n` +
-      `کد سفارش یا شناسه عددی رو بفرستید:\n(مثال: <code>QP4PGV</code> یا <code>42</code>)\n\n` +
+      `کد سفارش، شناسه سفارش یا آیدی کاربر رو بفرستید:\n` +
+      `(مثال: <code>QP4PGV</code> — <code>42</code> — <code>7184299507</code> — <code>@username</code>)\n\n` +
+      `💡 با آیدی تلگرام یا یوزرنیم، لیست سفارشات اون کاربر میاد.\n\n` +
       `برای لغو: <code>/cancel</code>`,
       { reply_markup: { inline_keyboard: [[BTN.danger("❌ انصراف", "admin_back")]] } }
     );
