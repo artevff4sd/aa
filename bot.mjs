@@ -802,10 +802,10 @@ async function handleMessage(msg) {
       ]}});
   }
 
-  // Admin commands
-  if (text === "/admin" || text === "/panel") { if (!isAdmin(tgId)) return send(chatId, "❌ <b>شما دسترسی ادمین ندارید.</b>"); await adminMenu(chatId); return; }
-  if (text === "/pending") { if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید."); await showOrders(chatId, "pending_approval"); return; }
-  if (text === "/orders") { if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید."); await showOrders(chatId, "all"); return; }
+  // Admin commands — هر ناوبری ادمین state ورودی قبلی رو لغو می‌کنه
+  if (text === "/admin" || text === "/panel") { if (!isAdmin(tgId)) return send(chatId, "❌ <b>شما دسترسی ادمین ندارید.</b>"); dbRun(`UPDATE users SET admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`); await adminMenu(chatId); return; }
+  if (text === "/pending") { if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید."); dbRun(`UPDATE users SET admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`); await showOrders(chatId, "pending_approval"); return; }
+  if (text === "/orders") { if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید."); dbRun(`UPDATE users SET admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`); await showOrders(chatId, "all"); return; }
 
   // === تشخیص کانال ===
   if (text === "/chaninfo") {
@@ -1615,6 +1615,15 @@ async function handleMessage(msg) {
     return;
   }
 
+  // Global /cancel — هر ورودی در انتظار (کاربر یا ادمین) رو لغو می‌کنه
+  if (text === "/cancel") {
+    const hadState = user.state !== "idle" || freshUser.admin_state;
+    dbRun(`UPDATE users SET state='idle', pending_gift_link=NULL, pending_star_count=NULL, admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE id=${user.id}`);
+    if (hadState) await send(chatId, "↩️ <b>عملیات قبلی لغو شد.</b>", mainMenuKb());
+    else await send(chatId, "چیزی برای لغو نبود — از منو ادامه بدید:", mainMenuKb());
+    return;
+  }
+
   // Await star count
   if (user.state === "awaiting_star_count" && user.pending_gift_link) {
     const sc = parseNum(normalizeDigits(text));
@@ -1820,6 +1829,12 @@ async function handleCallback(cq) {
   const tgId = cq.from.id, username = cq.from.username, firstName = cq.from.first_name || "کاربر";
   const user = ensureUser(tgId, username, firstName);
 
+  // ===== Anti-stale: هر دکمه‌ای که ادامه‌ی flow فعلی نیست، stateهای در انتظار ورودی رو پاک می‌کنه =====
+  const FLOW_CB_PREFIXES = ["fr_type_", "fr_gift_", "fr_count_pick_", "gift_skip_desc"];
+  if (!FLOW_CB_PREFIXES.some(p => data.startsWith(p)) && (user.state !== "idle" || user.admin_state)) {
+    dbRun(`UPDATE users SET state='idle', pending_gift_link=NULL, pending_star_count=NULL, admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`);
+  }
+
   // Channel membership check
   if (data === "check_member") {
     const mustChannels = dbAll("SELECT * FROM must_channels");
@@ -1965,10 +1980,15 @@ async function handleCallback(cq) {
       `قیمت هر ۱۰۰ ممبر : <code>${pricePer100}</code> تومان 💸\n` +
       `حداقل سفارش : ۱۰۰ عدد\n\n` +
       `${SEPARATOR}\n\n` +
-      `🔹 تعداد مورد نظر خود را از بین ۱۰۰ تا ۱٬۰۰۰ انتخاب کنید:`,
+      `🔹 تعداد مورد نظر خود را از بین ۱۰۰ تا ۱٬۰۰۰ انتخاب کنید:` +
+      (isAdmin(tgId) ? `\n\n📋 <b>گزارش فیک (ادمین):</b> دکمه‌های پایین — همون گزارش بخش خرید رو با اون تعداد به کانال گزارش ارسال می‌کنه.` : ""),
       { reply_markup: { inline_keyboard: [
         [BTN.success("100", "member_count_100"), BTN.success("250", "member_count_250"), BTN.success("500", "member_count_500")],
         [BTN.success("750", "member_count_750"), BTN.success("1000", "member_count_1000")],
+        ...(isAdmin(tgId) ? [
+          [BTN.primary("📋 گزارش فیک 100", "frq_member_100"), BTN.primary("📋 گزارش فیک 250", "frq_member_250"), BTN.primary("📋 گزارش فیک 500", "frq_member_500")],
+          [BTN.primary("📋 گزارش فیک 750", "frq_member_750"), BTN.primary("📋 گزارش فیک 1000", "frq_member_1000")],
+        ] : []),
         [BTN.neutral("🔙 بازگشت به منو", "menu_back")],
       ]}}
     );
@@ -2354,12 +2374,57 @@ async function handleCallback(cq) {
     dbRun(`UPDATE users SET admin_state='fr_count', admin_state_data='${fakeId}|${type}', updated_at=unixepoch() WHERE telegram_id=${tgId}`);
     const label = type === "star"
       ? `⭐ <b>تعداد ستاره</b> رو بفرستید:\n(مثال: <code>500</code>)`
-      : `👥 <b>تعداد ممبر</b> رو بفرستید (مضرب ۱۰۰):\n(مثال: <code>500</code>)`;
+      : `👥 <b>تعداد ممبر</b> رو انتخاب کنید (مثل بخش خرید):\n✍️ یا تعداد دلخواه رو تایپ کنید.`;
+    const kb = type === "member"
+      ? { reply_markup: { inline_keyboard: [
+          [BTN.success("100", "fr_count_pick_100"), BTN.success("250", "fr_count_pick_250"), BTN.success("500", "fr_count_pick_500")],
+          [BTN.success("750", "fr_count_pick_750"), BTN.success("1000", "fr_count_pick_1000")],
+          [BTN.danger("❌ انصراف", "fr_cancel")],
+        ]}}
+      : { reply_markup: { inline_keyboard: [[BTN.danger("❌ انصراف", "fr_cancel")]] } };
     await edit(chatId, msgId,
       `📋 <b>گزارش فیک — ${type === "star" ? "استار" : "ممبر"}</b>\n${SEPARATOR}\n\n${label}`,
-      { reply_markup: { inline_keyboard: [[BTN.danger("❌ انصراف", "fr_cancel")]] } }
+      kb
     );
     return answer(cq.id);
+  }
+
+  // ===== Fake Report Wizard — quick member count pick (مثل دکمه‌های بخش خرید) =====
+  if (data.startsWith("fr_count_pick_")) {
+    if (!isAdmin(tgId)) return answer(cq.id, "ادمین نیستید.", true);
+    if (user.admin_state !== "fr_count") return answer(cq.id, "منقضی شد — دوباره از منو شروع کنید.", true);
+    const [fakeIdStr, frType] = String(user.admin_state_data || "").split("|");
+    const fakeId = parseInt(fakeIdStr);
+    const n = parseInt(data.replace("fr_count_pick_", ""));
+    if (!fakeId || frType !== "member" || !n || n < 100) { dbRun(`UPDATE users SET admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`); return answer(cq.id, "منقضی شد.", true); }
+    dbRun(`UPDATE users SET admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`);
+    const price = Math.ceil(n / 100) * getNumSetting("member_price");
+    const ok = await sendFakeReport(chatId, { fakeId, typeLabel: "👤 ممبر بدون ریزش", count: n, price });
+    if (ok) await edit(chatId, msgId,
+      `✅ <b>گزارش فیک ارسال شد!</b>\n${SEPARATOR}\n\n` +
+      `📦 👤 ممبر بدون ریزش\n` +
+      `👀 تعداد: <code>${n}</code>\n` +
+      `💰 مبلغ: <code>${Number(price).toLocaleString("en-US")}</code> تومان\n` +
+      `👤 <code>${maskId(fakeId)}</code>`);
+    return answer(cq.id, ok ? "ارسال شد ✅" : "ارسال ناموفق ❌", !ok);
+  }
+
+  // ===== Admin quick fake member report — از منوی خرید ممبر =====
+  if (data.startsWith("frq_member_")) {
+    if (!isAdmin(tgId)) return answer(cq.id, "ادمین نیستید.", true);
+    dbRun(`UPDATE users SET state='idle', pending_gift_link=NULL, pending_star_count=NULL, admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`);
+    const n = parseInt(data.replace("frq_member_", ""));
+    if (!n || n < 100 || n > 100000) return answer(cq.id, "تعداد نامعتبر.", true);
+    const fakeId = genFakeId();
+    const price = Math.ceil(n / 100) * getNumSetting("member_price");
+    const ok = await sendFakeReport(chatId, { fakeId, typeLabel: "👤 ممبر بدون ریزش", count: n, price });
+    if (ok) await send(chatId,
+      `✅ <b>گزارش فیک ارسال شد!</b>\n${SEPARATOR}\n\n` +
+      `📦 👤 ممبر بدون ریزش\n` +
+      `👀 تعداد: <code>${n}</code>\n` +
+      `💰 مبلغ: <code>${Number(price).toLocaleString("en-US")}</code> تومان\n` +
+      `👤 <code>${maskId(fakeId)}</code>`);
+    return answer(cq.id, ok ? `گزارش فیک ${n} ممبر ارسال شد ✅` : "ارسال ناموفق ❌", !ok);
   }
 
   // ===== Fake Report Wizard — step 3: gift selected → send =====
