@@ -381,6 +381,61 @@ function cleanupOldOrders() {
 // Index for faster cleanup queries
 dbRun(`CREATE INDEX IF NOT EXISTS idx_orders_status_updated ON orders(status, updated_at)`);
 
+// ==================== Railway Credit ====================
+const RAILWAY_API_TOKEN = process.env.RAILWAY_API_TOKEN || "";
+const RAILWAY_WORKSPACE_ID = process.env.RAILWAY_WORKSPACE_ID || "";
+let rwCreditCache = { at: 0, val: null };
+async function getRailwayCredit() {
+  if (!RAILWAY_API_TOKEN) return { ok: false, reason: "no_token" };
+  const now = Date.now();
+  if (rwCreditCache.val && now - rwCreditCache.at < 5 * 60 * 1000) return rwCreditCache.val;
+  try {
+    const ac = new AbortController();
+    const to = setTimeout(() => ac.abort(), 8000);
+    const customerSel = `
+      customer {
+        creditBalance
+        remainingUsageCreditBalance
+        currentUsage
+        isTrialing
+        trialDaysRemaining
+        billingPeriod { start end }
+      }`;
+    let query, variables = {};
+    if (RAILWAY_WORKSPACE_ID) {
+      query = `query($wid: String!) { workspace(workspaceId: $wid) { name ${customerSel} } }`;
+      variables.wid = RAILWAY_WORKSPACE_ID;
+    } else {
+      query = `query { me { workspaces { name ${customerSel} } } }`;
+    }
+    const res = await fetch("https://backboard.railway.com/graphql/v2", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${RAILWAY_API_TOKEN}` },
+      body: JSON.stringify({ query, variables }),
+      signal: ac.signal,
+    });
+    clearTimeout(to);
+    const j = await res.json();
+    if (j.errors && j.errors.length) return { ok: false, reason: j.errors[0].message };
+    const ws = RAILWAY_WORKSPACE_ID ? j.data?.workspace : j.data?.me?.workspaces?.[0];
+    const c = ws?.customer;
+    if (!c) return { ok: false, reason: "no_data" };
+    const val = {
+      ok: true,
+      name: ws.name || "Railway",
+      credit: Number(c.creditBalance) || 0,
+      usage: Number(c.currentUsage) || 0,
+      trialing: !!c.isTrialing,
+      trialDays: c.trialDaysRemaining ?? 0,
+      periodEnd: c.billingPeriod?.end || null,
+    };
+    rwCreditCache = { at: now, val };
+    return val;
+  } catch (e) {
+    return { ok: false, reason: e.message || "fetch_failed" };
+  }
+}
+
 // Run cleanup on start
 cleanupOldOrders();
 setInterval(cleanupOldOrders, 6 * 60 * 60 * 1000); // every 6 hours
@@ -734,6 +789,22 @@ async function statsRender(chatId, msgId, period) {
     ? `✅ ست شده${lb ? ` — آخرین: ${toJalali(new Date(lb * 1000))}` : ""}`
     : "❌ تنظیم نشده";
 
+  // --- کردیت ریلوی
+  let creditTxt = "";
+  const rw = await getRailwayCredit();
+  if (rw.ok) {
+    creditTxt =
+      `\n💳 <b>کردیت Railway</b>\n` +
+      `• باقی‌مانده: <b>$${rw.credit.toFixed(2)}</b>` +
+      (rw.usage ? ` — مصرف این دوره: $${rw.usage.toFixed(2)}` : "") +
+      (rw.trialing ? ` (تریال — ${rw.trialDays} روز باقی)` : "") +
+      (rw.periodEnd ? `\n• پایان دوره: ${toJalali(new Date(rw.periodEnd))}` : "") + "\n";
+  } else if (rw.reason === "no_token") {
+    creditTxt = `\n💳 کردیت Railway: ❌ توکن تنظیم نشده (RAILWAY_API_TOKEN)\n`;
+  } else {
+    creditTxt = `\n💳 کردیت Railway: ⚠️ دریافت ناموفق (${esc(rw.reason)})\n`;
+  }
+
   const text =
     `📊 <b>آمار ربات</b> — ${STATS_LABELS[period]}\n${SEPARATOR}\n\n` +
     `👥 <b>کاربران</b>\n` +
@@ -748,6 +819,7 @@ async function statsRender(chatId, msgId, period) {
     `• در جریان (تایید + انتظار): ${fmtPrice(revPend)} تومان\n` +
     `• میانگین سفارش موفق: ${fmtPrice(avgOrder)} تومان\n\n` +
     `🔥 <b>پرفروش‌ترین‌ها</b>\n${topTxt}\n` +
+    `${creditTxt}` +
     `🛠 <b>سیستم</b>\n` +
     `• آپتایم: ${upTxt} — دیتابیس: ${dbSize}\n` +
     `• بات: ${getSetting("bot_enabled") === "0" ? "🔴 خاموش" : "🟢 روشن"}\n` +
