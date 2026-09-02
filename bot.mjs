@@ -385,8 +385,23 @@ dbRun(`CREATE INDEX IF NOT EXISTS idx_orders_status_updated ON orders(status, up
 const RAILWAY_API_TOKEN = process.env.RAILWAY_API_TOKEN || "";
 const RAILWAY_WORKSPACE_ID = process.env.RAILWAY_WORKSPACE_ID || "";
 let rwCreditCache = { at: 0, val: null };
+function rwToken() { return getSetting("railway_api_token") || RAILWAY_API_TOKEN; }
+function rwWorkspaceId() { return getSetting("railway_workspace_id") || RAILWAY_WORKSPACE_ID; }
+function getAppFlag(key) { const r = dbGet(`SELECT value FROM app_flags WHERE key='${key}'`); return r ? r.value : null; }
+function setAppFlag(key, value) {
+  const v = String(value);
+  const ex = dbGet(`SELECT key FROM app_flags WHERE key='${key}'`);
+  if (ex) dbRun(`UPDATE app_flags SET value='${v}' WHERE key='${key}'`);
+  else dbRun(`INSERT INTO app_flags (key, value) VALUES ('${key}', '${v}')`);
+}
+function rwThresholds() {
+  const days = getNumSetting("rw_alert_days") || 5;
+  const credit = parseFloat(String(getSetting("rw_alert_credit") || "2").replace(",", ".")) || 2;
+  return { days, credit };
+}
 async function getRailwayCredit() {
-  if (!RAILWAY_API_TOKEN) return { ok: false, reason: "no_token" };
+  const TOKEN = rwToken();
+  if (!TOKEN) return { ok: false, reason: "no_token" };
   const now = Date.now();
   if (rwCreditCache.val && now - rwCreditCache.at < 5 * 60 * 1000) return rwCreditCache.val;
   try {
@@ -402,22 +417,23 @@ async function getRailwayCredit() {
         billingPeriod { start end }
       }`;
     let query, variables = {};
-    if (RAILWAY_WORKSPACE_ID) {
+    const wid = rwWorkspaceId();
+    if (wid) {
       query = `query($wid: String!) { workspace(workspaceId: $wid) { name ${customerSel} } }`;
-      variables.wid = RAILWAY_WORKSPACE_ID;
+      variables.wid = wid;
     } else {
       query = `query { me { workspaces { name ${customerSel} } } }`;
     }
     const res = await fetch("https://backboard.railway.com/graphql/v2", {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${RAILWAY_API_TOKEN}` },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN}` },
       body: JSON.stringify({ query, variables }),
       signal: ac.signal,
     });
     clearTimeout(to);
     const j = await res.json();
     if (j.errors && j.errors.length) return { ok: false, reason: j.errors[0].message };
-    const ws = RAILWAY_WORKSPACE_ID ? j.data?.workspace : j.data?.me?.workspaces?.[0];
+    const ws = wid ? j.data?.workspace : j.data?.me?.workspaces?.[0];
     const c = ws?.customer;
     if (!c) return { ok: false, reason: "no_data" };
     const val = {
@@ -433,6 +449,61 @@ async function getRailwayCredit() {
     return val;
   } catch (e) {
     return { ok: false, reason: e.message || "fetch_failed" };
+  }
+}
+function rwDaysLeft(rw) {
+  if (rw.trialing) return rw.trialDays;
+  if (rw.periodEnd) return Math.floor((new Date(rw.periodEnd).getTime() - Date.now()) / 86400000);
+  return null;
+}
+function rwStatusText(rw) {
+  const th = rwThresholds();
+  const dl = rwDaysLeft(rw);
+  return (
+    `🛰 <b>کردیت Railway</b>\n${SEPARATOR}\n\n` +
+    `💳 <b>باقی‌مانده:</b> <code>$${rw.credit.toFixed(2)}</code>\n` +
+    `📉 <b>مصرف این دوره:</b> <code>$${rw.usage.toFixed(2)}</code>\n` +
+    (rw.trialing
+      ? `🧪 <b>حالت:</b> تریال — <code>${rw.trialDays}</code> روز باقی\n`
+      : (dl != null ? `📅 <b>پایان دوره:</b> ${toJalali(new Date(rw.periodEnd))} (<code>${dl}</code> روز)\n` : "")) +
+    `\n🔔 <b>هشدار:</b> ≤ ${th.days} روز یا ≤ $${th.credit.toFixed(2)}\n` +
+    (rw.name ? `🏷 <b>ورک‌اسپیس:</b> ${esc(rw.name)}\n` : "")
+  );
+}
+async function checkRailwayAlerts(reportChatId = null) {
+  const rw = await getRailwayCredit();
+  if (reportChatId) {
+    if (!rw.ok) await send(reportChatId, `❌ <b>دریافت کردیت Railway ناموفق:</b>\n<code>${esc(rw.reason || "")}</code>`);
+    else await send(reportChatId, rwStatusText(rw));
+  }
+  if (!rw.ok) return;
+  const th = rwThresholds();
+  const dl = rwDaysLeft(rw);
+  const lowDays = dl != null && dl <= th.days;
+  const lowCredit = rw.credit <= th.credit;
+  // هشدار روز
+  if (lowDays && getAppFlag("rw_alert_days") !== "1") {
+    setAppFlag("rw_alert_days", "1");
+    const msg =
+      `🚨 <b>هشدار کردیت Railway</b>\n${SEPARATOR}\n\n` +
+      `⏳ <b>زمان باقی‌مانده:</b> ${dl} روز${rw.trialing ? " (تریال)" : ""}\n` +
+      `💳 کردیت باقی‌مانده: <code>$${rw.credit.toFixed(2)}</code>\n\n` +
+      `⚠️ لطفاً حساب Railway رو شارژ یا تمدید کنید تا ربات خاموش نشه.`;
+    for (const adminId of ADMIN_IDS) { try { await send(adminId, msg); } catch {} }
+  } else if (!lowDays && getAppFlag("rw_alert_days") === "1") {
+    setAppFlag("rw_alert_days", "0");
+  }
+  // هشدار کردیت دلاری
+  if (lowCredit && getAppFlag("rw_alert_credit") !== "1") {
+    setAppFlag("rw_alert_credit", "1");
+    const msg =
+      `🚨 <b>هشدار کردیت Railway</b>\n${SEPARATOR}\n\n` +
+      `💳 <b>کردیت باقی‌مانده:</b> <code>$${rw.credit.toFixed(2)}</code> (حد هشدار: $${th.credit.toFixed(2)})\n` +
+      `📉 مصرف این دوره: <code>$${rw.usage.toFixed(2)}</code>\n\n` +
+      `⚠️ لطفاً حساب Railway رو شارژ کنید تا ربات متوقف نشه.`;
+    for (const adminId of ADMIN_IDS) { try { await send(adminId, msg); } catch {} }
+  } else if (!lowCredit && getAppFlag("rw_alert_credit") === "1") {
+    setAppFlag("rw_alert_credit", "0");
   }
 }
 
@@ -451,6 +522,7 @@ function settingsPanelKb() {
     [BTN.primary("🖼️ تغییر کانال عکس", "set_edit_img")],
     [BTN.primary("📢 مدیریت کانال‌های الزامی", "set_edit_must")],
     [BTN.primary("📦 تغییر کانال بکاپ", "set_edit_backup")],
+    [BTN.primary("🛰 کردیت Railway", "set_edit_railway")],
     [BTN.neutral("📦 بکاپ فوری", "backup_now")],
     [BTN.neutral("🔄 بروزرسانی", "admin_settings")],
     [BTN.neutral("🔙 بازگشت", "admin_back")],
@@ -462,6 +534,7 @@ function settingsPanelText() {
   const imgChannel = dbGet("SELECT * FROM img_channel LIMIT 1");
   const mustChannels = dbAll("SELECT * FROM must_channels ORDER BY id ASC");
   const sup = (getSetting("support_username") || DEFAULT_SETTINGS.support_username).replace(/^@/, "");
+  const th = rwThresholds();
   return (
     `⚙️ <b>تنظیمات فعلی</b>\n${SEPARATOR}\n\n` +
     `💳 <b>شماره کارت:</b>  <code>${cn}</code>\n` +
@@ -472,9 +545,45 @@ function settingsPanelText() {
     `📣 <b>کانال گزارشات:</b>  ${channel ? `<code>${channel.channel_id}</code> (${channel.channel_name || "-"})` : "❌ تنظیم نشده"}\n` +
     `🖼️ <b>کانال عکس گیفت‌ها:</b>  ${imgChannel ? `<code>${imgChannel.channel_id}</code> (${imgChannel.channel_name || "-"})` : "❌ تنظیم نشده"}\n` +
     `📢 <b>کانال‌های الزامی:</b>  ${mustChannels.length ? mustChannels.map(c => c.channel_name || c.channel_id).join(", ") : "❌ تنظیم نشده"}\n` +
-    `📦 <b>کانال بکاپ خودکار:</b>  ${getSetting("backup_channel") ? `<code>${esc(getSetting("backup_channel"))}</code> (هر ۵ ساعت)` : "❌ تنظیم نشده"}\n\n` +
+    `📦 <b>کانال بکاپ خودکار:</b>  ${getSetting("backup_channel") ? `<code>${esc(getSetting("backup_channel"))}</code> (هر ۵ ساعت)` : "❌ تنظیم نشده"}\n` +
+    `🛰 <b>کردیت Railway:</b>  ${rwTokenMasked()}\n\n` +
     `${SEPARATOR}\nروی دکمه مورد نظر بزنید:`
   );
+}
+function rwTokenMasked() {
+  const t = rwToken();
+  if (!t) return "❌ تنظیم نشده";
+  return `✅ ست شده (${esc(t.slice(0, 3))}••••${esc(t.slice(-4))})`;
+}
+async function railwayPanelText() {
+  const wid = rwWorkspaceId();
+  const th = rwThresholds();
+  let status;
+  const rw = await getRailwayCredit();
+  if (!rwToken()) status = "❌ توکن تنظیم نشده — اول توکن رو وارد کنید.";
+  else if (!rw.ok) status = `⚠️ دریافت ناموفق: <code>${esc(rw.reason || "?")}</code>`;
+  else status =
+    `💳 باقی‌مانده: <code>$${rw.credit.toFixed(2)}</code> — مصرف دوره: <code>$${rw.usage.toFixed(2)}</code>\n` +
+    (rw.trialing
+      ? `🧪 تریال — <code>${rw.trialDays}</code> روز باقی`
+      : (rwDaysLeft(rw) != null ? `📅 پایان دوره: ${toJalali(new Date(rw.periodEnd))}` : ""));
+  return (
+    `🛰 <b>تنظیمات کردیت Railway</b>\n${SEPARATOR}\n\n` +
+    `🔑 <b>توکن API:</b>  ${rwTokenMasked()}\n` +
+    `🪪 <b>آیدی ورک‌اسپیس:</b>  ${wid ? `<code>${esc(wid)}</code>` : "پیش‌فرض (اولین ورک‌اسپیس اکانت)"}\n` +
+    `🔔 <b>حد هشدار:</b>  ≤ <code>${th.days}</code> روز یا ≤ <code>$${th.credit.toFixed(2)}</code>\n\n` +
+    `${status}\n\n${SEPARATOR}\n` +
+    `💡 توکن رو از railway.com/account/tokens بسازید (Account Token).`
+  );
+}
+function railwayPanelKb() {
+  return { reply_markup: { inline_keyboard: [
+    [BTN.primary("🔑 تنظیم توکن", "set_edit_rw_token")],
+    [BTN.primary("🪪 تنظیم ورک‌اسپیس", "set_edit_rw_wid")],
+    [BTN.primary("📅 حد هشدار روز", "set_edit_rw_days"), BTN.primary("💵 حد هشدار کردیت", "set_edit_rw_credit")],
+    [BTN.neutral("🔄 بررسی الان", "rw_check")],
+    [BTN.neutral("🔙 بازگشت به تنظیمات", "admin_settings")],
+  ]}};
 }
 
 async function adminMenu(chatId) {
@@ -1503,6 +1612,79 @@ async function handleMessage(msg) {
     setSetting("support_username", sup);
     await send(chatId, `✅ <b>پشتیبانی بروزرسانی شد:</b> @${sup}`);
     await send(chatId, settingsPanelText(), settingsPanelKb());
+    return;
+  }
+
+  // Awaiting Railway API token
+  if (user.admin_state === "set_awaiting_rw_token") {
+    if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید.");
+    dbRun(`UPDATE users SET admin_state=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`);
+    const tok = text.trim();
+    if (tok.toLowerCase() === "delete") {
+      setSetting("railway_api_token", "");
+      rwCreditCache = { at: 0, val: null };
+      await send(chatId, `🗑️ <b>توکن Railway حذف شد.</b>`);
+      await send(chatId, await railwayPanelText(), railwayPanelKb());
+      return;
+    }
+    if (!tok || /\s/.test(tok) || tok.length < 10) {
+      await send(chatId, `❌ توکن نامعتبر بود (فاصله نداره و طولش بیشتر از ۱۰ کاراکتره). عملیات لغو شد.`);
+      return;
+    }
+    setSetting("railway_api_token", tok);
+    rwCreditCache = { at: 0, val: null };
+    const test = await getRailwayCredit();
+    if (test.ok) {
+      await send(chatId, `✅ <b>توکن ذخیره و تست شد!</b>\n\n💳 کردیت باقی‌مانده: <code>$${test.credit.toFixed(2)}</code>${test.usage ? `\n📉 مصرف این دوره: $${test.usage.toFixed(2)}` : ""}`);
+    } else {
+      await send(chatId, `⚠️ <b>توکن ذخیره شد ولی تست ناموفق بود:</b>\n<code>${esc(test.reason || "?")}</code>\n\nلطفاً از Account Token بودن و اعتبارش مطمئن شوید.`);
+    }
+    await send(chatId, await railwayPanelText(), railwayPanelKb());
+    return;
+  }
+
+  // Awaiting Railway workspace id
+  if (user.admin_state === "set_awaiting_rw_wid") {
+    if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید.");
+    dbRun(`UPDATE users SET admin_state=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`);
+    const wid = text.trim();
+    if (wid.toLowerCase() === "default" || wid === "-") {
+      setSetting("railway_workspace_id", "");
+      rwCreditCache = { at: 0, val: null };
+      await send(chatId, `✅ <b>ورک‌اسپیس روی پیش‌فرض (اولین ورک‌اسپیس اکانت) ست شد.</b>`);
+    } else if (!wid || /\s/.test(wid)) {
+      await send(chatId, `❌ آیدی نامعتبر بود. عملیات لغو شد.`);
+      return;
+    } else {
+      setSetting("railway_workspace_id", wid);
+      rwCreditCache = { at: 0, val: null };
+      await send(chatId, `✅ <b>آیدی ورک‌اسپیس ذخیره شد:</b> <code>${esc(wid)}</code>`);
+    }
+    await send(chatId, await railwayPanelText(), railwayPanelKb());
+    return;
+  }
+
+  // Awaiting Railway alert threshold — days
+  if (user.admin_state === "set_awaiting_rw_days") {
+    if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید.");
+    dbRun(`UPDATE users SET admin_state=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`);
+    const n = parseInt(normalizeDigits(text));
+    if (!n || n < 1 || n > 60) { await send(chatId, `❌ عدد نامعتبر بود (بین ۱ تا ۶۰). عملیات لغو شد.`); return; }
+    setSetting("rw_alert_days", String(n));
+    await send(chatId, `✅ <b>حد هشدار روز ذخیره شد:</b> ${n} روز`);
+    await send(chatId, await railwayPanelText(), railwayPanelKb());
+    return;
+  }
+
+  // Awaiting Railway alert threshold — credit
+  if (user.admin_state === "set_awaiting_rw_credit") {
+    if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید.");
+    dbRun(`UPDATE users SET admin_state=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`);
+    const v = parseFloat(normalizeDigits(text).replace(/[,،]/g, ".").replace(/[^\d.]/g, ""));
+    if (isNaN(v) || v < 0 || v > 10000) { await send(chatId, `❌ عدد نامعتبر بود. عملیات لغو شد.`); return; }
+    setSetting("rw_alert_credit", String(v));
+    await send(chatId, `✅ <b>حد هشدار کردیت ذخیره شد:</b> $${v.toFixed(2)}`);
+    await send(chatId, await railwayPanelText(), railwayPanelKb());
     return;
   }
 
@@ -2751,6 +2933,70 @@ async function handleCallback(cq) {
     return;
   }
 
+  // ===== Railway credit panel =====
+  if (data === "set_edit_railway") {
+    if (!isAdmin(tgId)) return answer(cq.id);
+    await editSmart(chatId, msgId, await railwayPanelText(), railwayPanelKb());
+    return answer(cq.id);
+  }
+  if (data === "set_edit_rw_token") {
+    if (!isAdmin(tgId)) return answer(cq.id);
+    dbRun(`UPDATE users SET admin_state='set_awaiting_rw_token', updated_at=unixepoch() WHERE telegram_id=${tgId}`);
+    await send(chatId,
+      `🔑 <b>تنظیم توکن Railway</b>\n${SEPARATOR}\n\n` +
+      `📝 توکن رو بفرستید.\n\n` +
+      `💡 از <a href="https://railway.com/account/tokens">railway.com/account/tokens</a> یه <b>Account Token</b> بسازید.\n` +
+      `⚠️ توکن محرمانه‌ست — فقط اینجا بفرستید.\n\n` +
+      `برای حذف توکن: <code>delete</code> بفرستید.`,
+      { reply_markup: { inline_keyboard: [[BTN.danger("❌ انصراف", "set_edit_railway")]] } }
+    );
+    return answer(cq.id);
+  }
+  if (data === "set_edit_rw_wid") {
+    if (!isAdmin(tgId)) return answer(cq.id);
+    dbRun(`UPDATE users SET admin_state='set_awaiting_rw_wid', updated_at=unixepoch() WHERE telegram_id=${tgId}`);
+    await send(chatId,
+      `🪪 <b>تنظیم ورک‌اسپیس Railway</b>\n${SEPARATOR}\n\n` +
+      `آیدی ورک‌اسپیس فعلی: ${rwWorkspaceId() ? `<code>${esc(rwWorkspaceId())}</code>` : "پیش‌فرض"}\n\n` +
+      `📝 آیدی ورک‌اسپیس رو بفرستید (اختیاری — اگه چند ورک‌اسپیس دارید).\n` +
+      `💡 آیدی توی URL پروژه هست: railway.com/workspace/<code>WORKSPACE_ID</code>/...\n\n` +
+      `برای برگشت به پیش‌فرض: <code>default</code> بفرستید.`,
+      { reply_markup: { inline_keyboard: [[BTN.danger("❌ انصراف", "set_edit_railway")]] } }
+    );
+    return answer(cq.id);
+  }
+  if (data === "set_edit_rw_days") {
+    if (!isAdmin(tgId)) return answer(cq.id);
+    dbRun(`UPDATE users SET admin_state='set_awaiting_rw_days', updated_at=unixepoch() WHERE telegram_id=${tgId}`);
+    await send(chatId,
+      `📅 <b>حد هشدار روز</b>\n${SEPARATOR}\n\n` +
+      `حد فعلی: <code>${rwThresholds().days}</code> روز\n\n` +
+      `📝 وقتی زمان باقی‌مانده به این عدد رسید (یا کمتر)، به همه ادمین‌ها الرت می‌فرستیم.\n` +
+      `مثال: <code>5</code>`,
+      { reply_markup: { inline_keyboard: [[BTN.danger("❌ انصراف", "set_edit_railway")]] } }
+    );
+    return answer(cq.id);
+  }
+  if (data === "set_edit_rw_credit") {
+    if (!isAdmin(tgId)) return answer(cq.id);
+    dbRun(`UPDATE users SET admin_state='set_awaiting_rw_credit', updated_at=unixepoch() WHERE telegram_id=${tgId}`);
+    await send(chatId,
+      `💵 <b>حد هشدار کردیت</b>\n${SEPARATOR}\n\n` +
+      `حد فعلی: <code>$${rwThresholds().credit.toFixed(2)}</code>\n\n` +
+      `📝 وقتی کردیت باقی‌مانده به این مقدار رسید (یا کمتر)، الرت می‌فرستیم.\n` +
+      `مثال: <code>2</code> یا <code>1.5</code>`,
+      { reply_markup: { inline_keyboard: [[BTN.danger("❌ انصراف", "set_edit_railway")]] } }
+    );
+    return answer(cq.id);
+  }
+  if (data === "rw_check") {
+    if (!isAdmin(tgId)) return answer(cq.id);
+    rwCreditCache = { at: 0, val: null };
+    await answer(cq.id, "در حال بررسی...");
+    await checkRailwayAlerts(chatId);
+    return;
+  }
+
   // Edit must-join channels
   if (data === "set_edit_must") {
     if (!isAdmin(tgId)) return answer(cq.id);
@@ -3116,5 +3362,8 @@ async function main() {
   poll();
   setTimeout(scheduledBackup, 60 * 1000);
   setInterval(scheduledBackup, 5 * 60 * 60 * 1000);
+  // بررسی دوره‌ای کردیت Railway + الرت به ادمین‌ها
+  setTimeout(() => checkRailwayAlerts().catch(() => {}), 90 * 1000);
+  setInterval(() => checkRailwayAlerts().catch(() => {}), 30 * 60 * 1000);
 }
 main();
