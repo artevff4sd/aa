@@ -1295,12 +1295,15 @@ async function handleMessage(msg) {
     }
 
     const ok = await sendFakeReport(chatId, { fakeId, typeLabel, count, price });
-    if (ok) await send(chatId,
-      `✅ <b>گزارش فیک ارسال شد!</b>\n${SEPARATOR}\n\n` +
-      `📦 ${typeLabel}\n` +
-      `👀 تعداد: <code>${count}</code>\n` +
-      `💰 مبلغ: <code>${Number(price).toLocaleString("en-US")}</code> تومان\n` +
-      `👤 <code>${maskId(fakeId)}</code>`);
+    if (ok) {
+      await send(chatId,
+        `✅ <b>گزارش فیک ارسال شد!</b>\n${SEPARATOR}\n\n` +
+        `📦 ${typeLabel}\n` +
+        `👀 تعداد: <code>${count}</code>\n` +
+        `💰 مبلغ: <code>${Number(price).toLocaleString("en-US")}</code> تومان\n` +
+        `👤 <code>${maskId(fakeId)}</code>`);
+      setTimeout(() => adminMenu(chatId), 600);
+    }
     return;
   }
 
@@ -2400,12 +2403,15 @@ async function handleCallback(cq) {
     dbRun(`UPDATE users SET admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`);
     const price = Math.ceil(n / 100) * getNumSetting("member_price");
     const ok = await sendFakeReport(chatId, { fakeId, typeLabel: "👤 ممبر بدون ریزش", count: n, price });
-    if (ok) await edit(chatId, msgId,
-      `✅ <b>گزارش فیک ارسال شد!</b>\n${SEPARATOR}\n\n` +
-      `📦 👤 ممبر بدون ریزش\n` +
-      `👀 تعداد: <code>${n}</code>\n` +
-      `💰 مبلغ: <code>${Number(price).toLocaleString("en-US")}</code> تومان\n` +
-      `👤 <code>${maskId(fakeId)}</code>`);
+    if (ok) {
+      await edit(chatId, msgId,
+        `✅ <b>گزارش فیک ارسال شد!</b>\n${SEPARATOR}\n\n` +
+        `📦 👤 ممبر بدون ریزش\n` +
+        `👀 تعداد: <code>${n}</code>\n` +
+        `💰 مبلغ: <code>${Number(price).toLocaleString("en-US")}</code> تومان\n` +
+        `👤 <code>${maskId(fakeId)}</code>`);
+      setTimeout(() => adminMenu(chatId), 600);
+    }
     return answer(cq.id, ok ? "ارسال شد ✅" : "ارسال ناموفق ❌", !ok);
   }
 
@@ -2418,12 +2424,15 @@ async function handleCallback(cq) {
     const fakeId = genFakeId();
     const price = Math.ceil(n / 100) * getNumSetting("member_price");
     const ok = await sendFakeReport(chatId, { fakeId, typeLabel: "👤 ممبر بدون ریزش", count: n, price });
-    if (ok) await send(chatId,
-      `✅ <b>گزارش فیک ارسال شد!</b>\n${SEPARATOR}\n\n` +
-      `📦 👤 ممبر بدون ریزش\n` +
-      `👀 تعداد: <code>${n}</code>\n` +
-      `💰 مبلغ: <code>${Number(price).toLocaleString("en-US")}</code> تومان\n` +
-      `👤 <code>${maskId(fakeId)}</code>`);
+    if (ok) {
+      await send(chatId,
+        `✅ <b>گزارش فیک ارسال شد!</b>\n${SEPARATOR}\n\n` +
+        `📦 👤 ممبر بدون ریزش\n` +
+        `👀 تعداد: <code>${n}</code>\n` +
+        `💰 مبلغ: <code>${Number(price).toLocaleString("en-US")}</code> تومان\n` +
+        `👤 <code>${maskId(fakeId)}</code>`);
+      setTimeout(() => adminMenu(chatId), 600);
+    }
     return answer(cq.id, ok ? `گزارش فیک ${n} ممبر ارسال شد ✅` : "ارسال ناموفق ❌", !ok);
   }
 
@@ -2442,8 +2451,11 @@ async function handleCallback(cq) {
       count: g.star_count,
       price: g.star_count * rate,
     });
-    if (ok) await edit(chatId, msgId,
-      `✅ <b>گزارش فیک ارسال شد!</b>\n\n📦 ${esc(g.name)}  •  ⭐ ${g.star_count}\n👤 <code>${maskId(fakeId)}</code>`);
+    if (ok) {
+      await edit(chatId, msgId,
+        `✅ <b>گزارش فیک ارسال شد!</b>\n\n📦 ${esc(g.name)}  •  ⭐ ${g.star_count}\n👤 <code>${maskId(fakeId)}</code>`);
+      setTimeout(() => adminMenu(chatId), 600);
+    }
     return answer(cq.id, ok ? "ارسال شد ✅" : undefined);
   }
 
