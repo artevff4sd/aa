@@ -423,18 +423,19 @@ async function getRailwayCredit() {
       query = `query { me { workspaces { name ${customerSel} } } }`;
     }
     const j = await rwGql(TOKEN, query, variables);
-    if (j.errors && j.errors.length) return { ok: false, reason: j.errors[0].message };
-    let ws = wid ? j.data?.workspace : j.data?.me?.workspaces?.[0];
-    // Workspace Token: کوئری me بلاک میشه — بدون wid، ورک‌اسپیس رو از پروژه‌ها کشف کن
+    let errMsg = (j.errors && j.errors.length) ? j.errors[0].message : null;
+    let ws = errMsg ? null : (wid ? j.data?.workspace : j.data?.me?.workspaces?.[0]);
+    // Workspace Token کوئری me رو بلاک می‌کنه — ورک‌اسپیس رو از پروژه‌ها پیدا کن
     if (!ws && !wid) {
       const disc = await rwDiscoverWorkspace(TOKEN);
       if (disc) {
         const j2 = await rwGql(TOKEN, `query($wid: String!) { workspace(workspaceId: $wid) { name ${customerSel} } }`, { wid: disc.id });
-        if (!(j2.errors && j2.errors.length)) ws = j2.data?.workspace;
+        if (j2.errors && j2.errors.length) { if (!errMsg) errMsg = j2.errors[0].message; }
+        else { ws = j2.data?.workspace; errMsg = null; if (!getSetting("railway_workspace_id")) setSetting("railway_workspace_id", disc.id); }
       }
     }
-    const c = ws?.customer;
-    if (!c) return { ok: false, reason: "no_data" };
+    if (!ws) return { ok: false, reason: errMsg || "no_data" };
+    const c = ws.customer;
     const val = {
       ok: true,
       name: ws.name || "Railway",
@@ -460,13 +461,13 @@ function rwStatusText(rw) {
   const dl = rwDaysLeft(rw);
   return (
     `🛰 <b>کردیت Railway</b>\n${SEPARATOR}\n\n` +
-    `💳 <b>باقی‌مانده:</b> <code>$${rw.credit.toFixed(2)}</code>\n` +
-    `📉 <b>مصرف این دوره:</b> <code>$${rw.usage.toFixed(2)}</code>\n` +
+    `💳 باقی‌مونده: <b>$${rw.credit.toFixed(2)}</b>\n` +
+    `📉 مصرف این دوره: $${rw.usage.toFixed(2)}\n` +
     (rw.trialing
-      ? `🧪 <b>حالت:</b> تریال — <code>${rw.trialDays}</code> روز باقی\n`
-      : (dl != null ? `📅 <b>پایان دوره:</b> ${toJalali(new Date(rw.periodEnd))} (<code>${dl}</code> روز)\n` : "")) +
-    `\n🔔 <b>هشدار:</b> ≤ ${th.days} روز یا ≤ $${th.credit.toFixed(2)}\n` +
-    (rw.name ? `🏷 <b>ورک‌اسپیس:</b> ${esc(rw.name)}\n` : "")
+      ? `🧪 تریال — <b>${rw.trialDays} روز</b> مونده\n`
+      : (dl != null ? `📅 دوره تا ${toJalali(new Date(rw.periodEnd))} — <b>${dl} روز</b> مونده\n` : "")) +
+    (rw.name ? `🏷 ${esc(rw.name)}\n` : "") +
+    `\n🔔 هشدار: ${th.days} روز آخر یا زیر $${th.credit.toFixed(2)}`
   );
 }
 async function checkRailwayAlerts(reportChatId = null) {
@@ -484,10 +485,10 @@ async function checkRailwayAlerts(reportChatId = null) {
   if (lowDays && getAppFlag("rw_alert_days") !== "1") {
     setAppFlag("rw_alert_days", "1");
     const msg =
-      `🚨 <b>هشدار کردیت Railway</b>\n${SEPARATOR}\n\n` +
-      `⏳ <b>زمان باقی‌مانده:</b> ${dl} روز${rw.trialing ? " (تریال)" : ""}\n` +
-      `💳 کردیت باقی‌مانده: <code>$${rw.credit.toFixed(2)}</code>\n\n` +
-      `⚠️ لطفاً حساب Railway رو شارژ یا تمدید کنید تا ربات خاموش نشه.`;
+      `🚨 <b>کردیت Railway داره تموم میشه</b>\n${SEPARATOR}\n\n` +
+      `⏳ فقط <b>${dl} روز</b> مونده${rw.trialing ? " (تریال)" : ""}\n` +
+      `💳 باقی‌مونده: $${rw.credit.toFixed(2)}\n\n` +
+      `حساب رو شارژ یا تمدید کن که ربات قطع نشه.`;
     for (const adminId of ADMIN_IDS) { try { await send(adminId, msg); } catch {} }
   } else if (!lowDays && getAppFlag("rw_alert_days") === "1") {
     setAppFlag("rw_alert_days", "0");
@@ -496,10 +497,10 @@ async function checkRailwayAlerts(reportChatId = null) {
   if (lowCredit && getAppFlag("rw_alert_credit") !== "1") {
     setAppFlag("rw_alert_credit", "1");
     const msg =
-      `🚨 <b>هشدار کردیت Railway</b>\n${SEPARATOR}\n\n` +
-      `💳 <b>کردیت باقی‌مانده:</b> <code>$${rw.credit.toFixed(2)}</code> (حد هشدار: $${th.credit.toFixed(2)})\n` +
-      `📉 مصرف این دوره: <code>$${rw.usage.toFixed(2)}</code>\n\n` +
-      `⚠️ لطفاً حساب Railway رو شارژ کنید تا ربات متوقف نشه.`;
+      `🚨 <b>کردیت Railway کم اومد</b>\n${SEPARATOR}\n\n` +
+      `💳 باقی‌مونده: <b>$${rw.credit.toFixed(2)}</b>\n` +
+      `📉 مصرف این دوره: $${rw.usage.toFixed(2)}\n\n` +
+      `حساب رو شارژ کن که ربات قطع نشه.`;
     for (const adminId of ADMIN_IDS) { try { await send(adminId, msg); } catch {} }
   } else if (!lowCredit && getAppFlag("rw_alert_credit") === "1") {
     setAppFlag("rw_alert_credit", "0");
@@ -559,19 +560,19 @@ async function railwayPanelText() {
   const th = rwThresholds();
   let status;
   const rw = await getRailwayCredit();
-  if (!rwToken()) status = "❌ توکن تنظیم نشده — اول توکن رو وارد کنید.";
-  else if (!rw.ok) status = `⚠️ دریافت ناموفق: <code>${esc(rw.reason || "?")}</code>`;
+  if (!rwToken()) status = "❌ هنوز توکن ندادی.";
+  else if (!rw.ok) status = `❌ کردیت رو نگرفتم: <code>${esc(rw.reason || "?")}</code>`;
   else status =
-    `💳 باقی‌مانده: <code>$${rw.credit.toFixed(2)}</code> — مصرف دوره: <code>$${rw.usage.toFixed(2)}</code>\n` +
+    `💳 باقی‌مونده: <b>$${rw.credit.toFixed(2)}</b> — مصرف: $${rw.usage.toFixed(2)}\n` +
     (rw.trialing
-      ? `🧪 تریال — <code>${rw.trialDays}</code> روز باقی`
-      : (rwDaysLeft(rw) != null ? `📅 پایان دوره: ${toJalali(new Date(rw.periodEnd))}` : ""));
+      ? `🧪 تریال — ${rw.trialDays} روز مونده`
+      : (rwDaysLeft(rw) != null ? `📅 دوره تا ${toJalali(new Date(rw.periodEnd))}` : ""));
   return (
-    `🛰 <b>تنظیمات کردیت Railway</b>\n${SEPARATOR}\n\n` +
-    `🔑 <b>توکن API:</b>  ${rwTokenMasked()}\n` +
-    `🪪 <b>آیدی ورک‌اسپیس:</b>  ${wid ? `<code>${esc(wid)}</code>` : "پیش‌فرض (اولین ورک‌اسپیس اکانت)"}\n` +
-    `🔔 <b>حد هشدار:</b>  ≤ <code>${th.days}</code> روز یا ≤ <code>$${th.credit.toFixed(2)}</code>\n\n` +
-    `${status}\n\n${SEPARATOR}\n`
+    `🛰 <b>کردیت Railway</b>\n${SEPARATOR}\n\n` +
+    `🔑 توکن:  ${rwTokenMasked()}\n` +
+    `🪪 ورک‌اسپیس:  ${wid ? `<code>${esc(wid)}</code>` : "پیش‌فرض"}\n` +
+    `🔔 هشدار:  ${th.days} روز آخر یا زیر $${th.credit.toFixed(2)}\n\n` +
+    `${status}`
   );
 }
 function railwayPanelKb() {
@@ -1642,21 +1643,21 @@ async function handleMessage(msg) {
     if (tok.toLowerCase() === "delete") {
       setSetting("railway_api_token", "");
       rwCreditCache = { at: 0, val: null };
-      await send(chatId, `🗑️ <b>توکن Railway حذف شد.</b>`);
+      await send(chatId, `🗑️ توکن حذف شد.`);
       await send(chatId, await railwayPanelText(), railwayPanelKb());
       return;
     }
     if (!tok || /\s/.test(tok) || tok.length < 10) {
-      await send(chatId, `❌ توکن نامعتبر بود (فاصله نداره و طولش بیشتر از ۱۰ کاراکتره). عملیات لغو شد.`);
+      await send(chatId, `❌ این توکن نیست — دوباره بفرست یا انصراف بزن.`);
       return;
     }
     setSetting("railway_api_token", tok);
     rwCreditCache = { at: 0, val: null };
     const test = await getRailwayCredit();
     if (test.ok) {
-      await send(chatId, `✅ <b>توکن ذخیره و تست شد!</b>\n\n💳 کردیت باقی‌مانده: <code>$${test.credit.toFixed(2)}</code>${test.usage ? `\n📉 مصرف این دوره: $${test.usage.toFixed(2)}` : ""}`);
+      await send(chatId, `✅ توکن اوکیه!\n💳 باقی‌مونده: <b>$${test.credit.toFixed(2)}</b>${test.usage ? `\n📉 مصرف این دوره: $${test.usage.toFixed(2)}` : ""}`);
     } else {
-      await send(chatId, `⚠️ <b>توکن ذخیره شد ولی تست ناموفق بود:</b>\n<code>${esc(test.reason || "?")}</code>\n\nلطفاً از Account Token بودن و اعتبارش مطمئن شوید.`);
+      await send(chatId, `❌ با این توکن وصل نشدم: <code>${esc(test.reason || "?")}</code>\nچک کن توکن کپی شده باشه و منقضی نباشه.`);
     }
     await send(chatId, await railwayPanelText(), railwayPanelKb());
     return;
@@ -1670,14 +1671,14 @@ async function handleMessage(msg) {
     if (wid.toLowerCase() === "default" || wid === "-") {
       setSetting("railway_workspace_id", "");
       rwCreditCache = { at: 0, val: null };
-      await send(chatId, `✅ <b>ورک‌اسپیس روی پیش‌فرض (اولین ورک‌اسپیس اکانت) ست شد.</b>`);
+      await send(chatId, `✅ روی پیش‌فرض رفت.`);
     } else if (!wid || /\s/.test(wid)) {
-      await send(chatId, `❌ آیدی نامعتبر بود. عملیات لغو شد.`);
+      await send(chatId, `❌ آیدی نامعتبره — لغو شد.`);
       return;
     } else {
       setSetting("railway_workspace_id", wid);
       rwCreditCache = { at: 0, val: null };
-      await send(chatId, `✅ <b>آیدی ورک‌اسپیس ذخیره شد:</b> <code>${esc(wid)}</code>`);
+      await send(chatId, `✅ ذخیره شد: <code>${esc(wid)}</code>`);
     }
     await send(chatId, await railwayPanelText(), railwayPanelKb());
     return;
@@ -1688,9 +1689,9 @@ async function handleMessage(msg) {
     if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید.");
     dbRun(`UPDATE users SET admin_state=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`);
     const n = parseInt(normalizeDigits(text));
-    if (!n || n < 1 || n > 60) { await send(chatId, `❌ عدد نامعتبر بود (بین ۱ تا ۶۰). عملیات لغو شد.`); return; }
+    if (!n || n < 1 || n > 60) { await send(chatId, `❌ عدد نامعتبره (۱ تا ۶۰) — لغو شد.`); return; }
     setSetting("rw_alert_days", String(n));
-    await send(chatId, `✅ <b>حد هشدار روز ذخیره شد:</b> ${n} روز`);
+    await send(chatId, `✅ شد <b>${n} روز</b>.`);
     await send(chatId, await railwayPanelText(), railwayPanelKb());
     return;
   }
@@ -1700,9 +1701,9 @@ async function handleMessage(msg) {
     if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید.");
     dbRun(`UPDATE users SET admin_state=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`);
     const v = parseFloat(normalizeDigits(text).replace(/[,،]/g, ".").replace(/[^\d.]/g, ""));
-    if (isNaN(v) || v < 0 || v > 10000) { await send(chatId, `❌ عدد نامعتبر بود. عملیات لغو شد.`); return; }
+    if (isNaN(v) || v < 0 || v > 10000) { await send(chatId, `❌ عدد نامعتبره — لغو شد.`); return; }
     setSetting("rw_alert_credit", String(v));
-    await send(chatId, `✅ <b>حد هشدار کردیت ذخیره شد:</b> $${v.toFixed(2)}`);
+    await send(chatId, `✅ شد <b>$${v.toFixed(2)}</b>.`);
     await send(chatId, await railwayPanelText(), railwayPanelKb());
     return;
   }
@@ -2962,10 +2963,9 @@ async function handleCallback(cq) {
     if (!isAdmin(tgId)) return answer(cq.id);
     dbRun(`UPDATE users SET admin_state='set_awaiting_rw_token', updated_at=unixepoch() WHERE telegram_id=${tgId}`);
     await send(chatId,
-      `🔑 <b>تنظیم توکن Railway</b>\n${SEPARATOR}\n\n` +
-      `📝 توکن رو بفرستید.\n\n` +
-      `⚠️ توکن محرمانه‌ست — فقط اینجا بفرستید.\n\n` +
-      `برای حذف توکن: <code>delete</code> بفرستید.`,
+      `🔑 <b>توکن Railway</b>\n${SEPARATOR}\n\n` +
+      `توکن رو بفرست (محرمانه‌ست، همینجا فقط).\n\n` +
+      `❌ برای حذف: <code>delete</code>`,
       { reply_markup: { inline_keyboard: [[BTN.danger("❌ انصراف", "set_edit_railway")]] } }
     );
     return answer(cq.id);
@@ -2974,11 +2974,10 @@ async function handleCallback(cq) {
     if (!isAdmin(tgId)) return answer(cq.id);
     dbRun(`UPDATE users SET admin_state='set_awaiting_rw_wid', updated_at=unixepoch() WHERE telegram_id=${tgId}`);
     await send(chatId,
-      `🪪 <b>تنظیم ورک‌اسپیس Railway</b>\n${SEPARATOR}\n\n` +
-      `آیدی ورک‌اسپیس فعلی: ${rwWorkspaceId() ? `<code>${esc(rwWorkspaceId())}</code>` : "پیش‌فرض"}\n\n` +
-      `📝 آیدی ورک‌اسپیس رو بفرستید (اختیاری — اگه چند ورک‌اسپیس دارید).\n` +
-      `💡 آیدی توی URL پروژه هست: railway.com/workspace/<code>WORKSPACE_ID</code>/...\n\n` +
-      `برای برگشت به پیش‌فرض: <code>default</code> بفرستید.`,
+      `🪪 <b>ورک‌اسپیس Railway</b>\n${SEPARATOR}\n\n` +
+      `فعلی: ${rwWorkspaceId() ? `<code>${esc(rwWorkspaceId())}</code>` : "پیش‌فرض"}\n\n` +
+      `اگه چند ورک‌اسپیس داری، آیدی‌ش رو بفرست.\n` +
+      `برای پیش‌فرض: <code>default</code>`,
       { reply_markup: { inline_keyboard: [[BTN.danger("❌ انصراف", "set_edit_railway")]] } }
     );
     return answer(cq.id);
@@ -2987,10 +2986,9 @@ async function handleCallback(cq) {
     if (!isAdmin(tgId)) return answer(cq.id);
     dbRun(`UPDATE users SET admin_state='set_awaiting_rw_days', updated_at=unixepoch() WHERE telegram_id=${tgId}`);
     await send(chatId,
-      `📅 <b>حد هشدار روز</b>\n${SEPARATOR}\n\n` +
-      `حد فعلی: <code>${rwThresholds().days}</code> روز\n\n` +
-      `📝 وقتی زمان باقی‌مانده به این عدد رسید (یا کمتر)، به همه ادمین‌ها الرت می‌فرستیم.\n` +
-      `مثال: <code>5</code>`,
+      `📅 <b>هشدار چند روز مونده؟</b>\n${SEPARATOR}\n\n` +
+      `فعلی: <b>${rwThresholds().days}</b> روز\n\n` +
+      `عدد بفرست (۱ تا ۶۰)، مثلاً <code>5</code>`,
       { reply_markup: { inline_keyboard: [[BTN.danger("❌ انصراف", "set_edit_railway")]] } }
     );
     return answer(cq.id);
@@ -2999,10 +2997,9 @@ async function handleCallback(cq) {
     if (!isAdmin(tgId)) return answer(cq.id);
     dbRun(`UPDATE users SET admin_state='set_awaiting_rw_credit', updated_at=unixepoch() WHERE telegram_id=${tgId}`);
     await send(chatId,
-      `💵 <b>حد هشدار کردیت</b>\n${SEPARATOR}\n\n` +
-      `حد فعلی: <code>$${rwThresholds().credit.toFixed(2)}</code>\n\n` +
-      `📝 وقتی کردیت باقی‌مانده به این مقدار رسید (یا کمتر)، الرت می‌فرستیم.\n` +
-      `مثال: <code>2</code> یا <code>1.5</code>`,
+      `💵 <b>هشدار زیر چند دلار؟</b>\n${SEPARATOR}\n\n` +
+      `فعلی: <b>$${rwThresholds().credit.toFixed(2)}</b>\n\n` +
+      `عدد بفرست، مثلاً <code>2</code> یا <code>1.5</code>`,
       { reply_markup: { inline_keyboard: [[BTN.danger("❌ انصراف", "set_edit_railway")]] } }
     );
     return answer(cq.id);
