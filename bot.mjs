@@ -405,8 +405,6 @@ async function getRailwayCredit() {
   const now = Date.now();
   if (rwCreditCache.val && now - rwCreditCache.at < 5 * 60 * 1000) return rwCreditCache.val;
   try {
-    const ac = new AbortController();
-    const to = setTimeout(() => ac.abort(), 8000);
     const customerSel = `
       customer {
         creditBalance
@@ -424,16 +422,17 @@ async function getRailwayCredit() {
     } else {
       query = `query { me { workspaces { name ${customerSel} } } }`;
     }
-    const res = await fetch("https://backboard.railway.com/graphql/v2", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN}` },
-      body: JSON.stringify({ query, variables }),
-      signal: ac.signal,
-    });
-    clearTimeout(to);
-    const j = await res.json();
+    const j = await rwGql(TOKEN, query, variables);
     if (j.errors && j.errors.length) return { ok: false, reason: j.errors[0].message };
-    const ws = wid ? j.data?.workspace : j.data?.me?.workspaces?.[0];
+    let ws = wid ? j.data?.workspace : j.data?.me?.workspaces?.[0];
+    // Workspace Token: کوئری me بلاک میشه — بدون wid، ورک‌اسپیس رو از پروژه‌ها کشف کن
+    if (!ws && !wid) {
+      const disc = await rwDiscoverWorkspace(TOKEN);
+      if (disc) {
+        const j2 = await rwGql(TOKEN, `query($wid: String!) { workspace(workspaceId: $wid) { name ${customerSel} } }`, { wid: disc.id });
+        if (!(j2.errors && j2.errors.length)) ws = j2.data?.workspace;
+      }
+    }
     const c = ws?.customer;
     if (!c) return { ok: false, reason: "no_data" };
     const val = {
@@ -572,8 +571,7 @@ async function railwayPanelText() {
     `🔑 <b>توکن API:</b>  ${rwTokenMasked()}\n` +
     `🪪 <b>آیدی ورک‌اسپیس:</b>  ${wid ? `<code>${esc(wid)}</code>` : "پیش‌فرض (اولین ورک‌اسپیس اکانت)"}\n` +
     `🔔 <b>حد هشدار:</b>  ≤ <code>${th.days}</code> روز یا ≤ <code>$${th.credit.toFixed(2)}</code>\n\n` +
-    `${status}\n\n${SEPARATOR}\n` +
-    `💡 توکن رو از railway.com/account/tokens بسازید (Account Token).`
+    `${status}\n\n${SEPARATOR}\n`
   );
 }
 function railwayPanelKb() {
@@ -584,6 +582,27 @@ function railwayPanelKb() {
     [BTN.neutral("🔄 بررسی الان", "rw_check")],
     [BTN.neutral("🔙 بازگشت به تنظیمات", "admin_settings")],
   ]}};
+}
+async function rwGql(token, query, variables = {}) {
+  const ac = new AbortController();
+  const to = setTimeout(() => ac.abort(), 8000);
+  try {
+    const res = await fetch("https://backboard.railway.com/graphql/v2", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ query, variables }),
+      signal: ac.signal,
+    });
+    clearTimeout(to);
+    return await res.json();
+  } catch (e) { clearTimeout(to); throw e; }
+}
+// Workspace Token به me دسترسی نداره — از پروژه‌ها آیدی ورک‌اسپیس کشف میشه
+async function rwDiscoverWorkspace(token) {
+  try {
+    const j = await rwGql(token, `query { projects(first: 1) { edges { node { workspace { id name } } } } }`);
+    return j.data?.projects?.edges?.[0]?.node?.workspace || null;
+  } catch { return null; }
 }
 
 async function adminMenu(chatId) {
@@ -2945,7 +2964,6 @@ async function handleCallback(cq) {
     await send(chatId,
       `🔑 <b>تنظیم توکن Railway</b>\n${SEPARATOR}\n\n` +
       `📝 توکن رو بفرستید.\n\n` +
-      `💡 از <a href="https://railway.com/account/tokens">railway.com/account/tokens</a> یه <b>Account Token</b> بسازید.\n` +
       `⚠️ توکن محرمانه‌ست — فقط اینجا بفرستید.\n\n` +
       `برای حذف توکن: <code>delete</code> بفرستید.`,
       { reply_markup: { inline_keyboard: [[BTN.danger("❌ انصراف", "set_edit_railway")]] } }
