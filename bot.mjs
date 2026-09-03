@@ -94,6 +94,15 @@ try { dbRun("SELECT image_file_id FROM gifts LIMIT 1"); } catch { dbRun("ALTER T
 // Add fake column to orders (for stats exclusion)
 try { dbRun("SELECT fake FROM orders LIMIT 1"); } catch { dbRun("ALTER TABLE orders ADD COLUMN fake INTEGER DEFAULT 0"); }
 
+// Referral & wallet columns
+try { dbRun("SELECT referred_by FROM users LIMIT 1"); } catch { dbRun("ALTER TABLE users ADD COLUMN referred_by INTEGER"); }
+try { dbRun("SELECT wallet FROM users LIMIT 1"); } catch { dbRun("ALTER TABLE users ADD COLUMN wallet INTEGER DEFAULT 0"); }
+
+// ==================== Referral ====================
+const REFERRAL_REWARD = 2000;
+const REFERRAL_CAP = 10;
+function refCountOf(userId) { return dbGet(`SELECT COUNT(*) as c FROM users WHERE referred_by=${userId}`)?.c || 0; }
+
 // App flags table (for stats epoch etc.)
 dbRun(`CREATE TABLE IF NOT EXISTS app_flags (key TEXT PRIMARY KEY, value TEXT)`);
 function getStatsEpoch() { const r = dbGet(`SELECT value FROM app_flags WHERE key='stats_epoch'`); return r ? Number(r.value) : 0; }
@@ -157,13 +166,19 @@ function resetUserState(userId) {
 function cancelStalePending(userId) {
   dbRun(`UPDATE orders SET status='cancelled', updated_at=unixepoch() WHERE user_id=${userId} AND status='pending'`);
 }
-function mainMenuKb() { return { reply_markup: { inline_keyboard: [
-  btnRow(BTN.success("🎁  خرید گیفت تلگرام", "menu_gift")),
-  btnRow(BTN.success("⭐️  خرید استار تلگرام", "menu_star")),
-  btnRow(BTN.success("👤  خرید ممبر", "menu_member")),
-  btnRow(BTN.primary("📦  سفارش‌های من", "menu_orders")),
-  btnRow(BTN.primary("💬  پشتیبانی", "menu_support")),
-]}}; }
+function mainMenuRows(tgId) {
+  const rows = [
+    btnRow(BTN.success("🎁  خرید گیفت تلگرام", "menu_gift")),
+    btnRow(BTN.success("⭐️  خرید استار تلگرام", "menu_star")),
+    btnRow(BTN.success("👤  خرید ممبر", "menu_member")),
+    [BTN.primary("زیر مجموعه گیری 👥", "menu_ref"), BTN.primary("حساب کاربری👤 💳", "menu_account")],
+    btnRow(BTN.primary("📦  سفارش‌های من", "menu_orders")),
+    btnRow(BTN.primary("💬  پشتیبانی", "menu_support")),
+  ];
+  if (tgId && isAdmin(tgId)) rows.push(btnRow(BTN.danger("🛠 پنل مدیریت", "admin_panel_btn")));
+  return rows;
+}
+function mainMenuKb(tgId) { return { reply_markup: { inline_keyboard: mainMenuRows(tgId) } }; }
 
 function genFakeId() {
   const len = 8 + Math.floor(Math.random() * 2);
@@ -642,8 +657,19 @@ async function adminMenu(chatId) {
       btnRow(BTN.info("📋 گزارش فیک", "admin_fake_report")),
       btnRow(BTN.primary("🔎 جستجوی سفارش", "admin_search")),
       btnRow(BTN.danger("⚠️ Danger Zone", "admin_danger")),
+      btnRow(BTN.neutral("🏠 منوی کاربری", "user_home")),
     ]}}
   );
+}
+
+// User home (from admin panel)
+function userHomeText() {
+  return `✨ <b>${BOT_NAME} Bot</b> ✨\n` +
+    `🎁 خرید گیفت و استار تلگرام\n` +
+    `${SEPARATOR}\n` +
+    `🌟 از منوی زیر، سرویس موردنظرت رو انتخاب کن:\n` +
+    `${SEPARATOR}\n` +
+    `⚡️ سریع • امن • آسان`;
 }
 
 async function showOrders(chatId, status, page = 0) {
@@ -973,13 +999,7 @@ async function showMainMenu(chatId, tgId) {
     `🌟 از منوی زیر، سرویس موردنظرت رو انتخاب کن:\n` +
     `${SEPARATOR}\n` +
     `⚡️ سریع • امن • آسان`,
-    { reply_markup: { inline_keyboard: [
-      btnRow(BTN.success("🎁  خرید گیفت تلگرام", "menu_gift")),
-      btnRow(BTN.success("⭐️  خرید استار تلگرام", "menu_star")),
-      btnRow(BTN.success("👤  خرید ممبر", "menu_member")),
-      btnRow(BTN.primary("📦  سفارش‌های من", "menu_orders")),
-      btnRow(BTN.primary("💬  پشتیبانی", "menu_support")),
-    ]}}
+    mainMenuKb(tgId)
   );
 }
 
@@ -1485,9 +1505,14 @@ async function handleMessage(msg) {
     const users = dbAll("SELECT telegram_id FROM users");
     let sent = 0, failed = 0;
     for (const u of users) {
-      try { await send(u.telegram_id, text); sent++; } catch { failed++; }
+      try {
+        const r = await send(u.telegram_id, text, { reply_markup: { inline_keyboard: [
+          [BTN.danger("🗑 حذف پیام", "del_broadcast")],
+        ]}});
+        if (r.ok) sent++; else failed++;
+      } catch { failed++; }
     }
-    await send(chatId, `📢 <b>ارسال همگانی انجام شد!</b>\n\n✅ موفق: <code>${sent}</code>\n❌ ناموفق: <code>${failed}</code>`);
+    await send(chatId, `📢 <b>ارسال همگانی انجام شد!</b>\n\n✅ موفق: <code>${sent}</code>\n❌ ناموفق: <code>${failed}</code>\n\n💡 هر کاربر می‌تواند با دکمه «🗑 حذف پیام» پیام را پاک کند.`);
     return;
   }
 
@@ -1855,7 +1880,26 @@ async function handleMessage(msg) {
   }
 
   // /start
-  if (text === "/start") {
+  if (text === "/start" || /^\/start\s+\d+$/.test(text)) {
+    // Referral deep-link: /start <referrer_telegram_id>
+    if (/^\/start\s+\d+$/.test(text)) {
+      const refTgId = parseInt(text.split(/\s+/)[1]);
+      const already = dbGet(`SELECT referred_by FROM users WHERE id=${user.id}`)?.referred_by;
+      if (!already && refTgId && refTgId !== tgId) {
+        const referrer = dbGet(`SELECT * FROM users WHERE telegram_id=${refTgId}`);
+        if (referrer) {
+          dbRun(`UPDATE users SET referred_by=${referrer.id}, updated_at=unixepoch() WHERE id=${user.id}`);
+          const paid = refCountOf(referrer.id) <= REFERRAL_CAP;
+          if (paid) dbRun(`UPDATE users SET wallet=(wallet + ${REFERRAL_REWARD}), updated_at=unixepoch() WHERE id=${referrer.id}`);
+          try { await send(referrer.telegram_id,
+            `🎉 <b>یک زیرمجموعه جدید!</b>\n${SEPARATOR}\n\n` +
+            `👤 <b>${esc(firstName)}</b> با لینک دعوت تو وارد بات شد!\n` +
+            (paid ? `💰 <code>${fmtPrice(REFERRAL_REWARD)}</code> تومان به کیف پولت اضافه شد.\n\n` : "\n") +
+            `👥 زیرمجموعه‌های شما: <code>${refCountOf(referrer.id)}</code>`
+          ); } catch {}
+        }
+      }
+    }
     // Cancel any pending orders and reset everything for a clean start
     dbRun(`UPDATE orders SET status='cancelled', updated_at=unixepoch() WHERE user_id=${user.id} AND status='pending'`);
     dbRun(`UPDATE users SET state='idle', pending_gift_link=NULL, pending_star_count=NULL, admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE id=${user.id}`);
@@ -1914,8 +1958,8 @@ async function handleMessage(msg) {
   if (text === "/cancel") {
     const hadState = user.state !== "idle" || freshUser.admin_state;
     dbRun(`UPDATE users SET state='idle', pending_gift_link=NULL, pending_star_count=NULL, admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE id=${user.id}`);
-    if (hadState) await send(chatId, "↩️ <b>عملیات قبلی لغو شد.</b>", mainMenuKb());
-    else await send(chatId, "چیزی برای لغو نبود — از منو ادامه بدید:", mainMenuKb());
+    if (hadState) await send(chatId, "↩️ <b>عملیات قبلی لغو شد.</b>", mainMenuKb(tgId));
+    else await send(chatId, "چیزی برای لغو نبود — از منو ادامه بدید:", mainMenuKb(tgId));
     return;
   }
 
@@ -1999,7 +2043,7 @@ async function handleMessage(msg) {
     return send(chatId,
       `📸 <b>عکس رسید پرداخت</b>\n${SEPARATOR}\n\n` +
       `رسید فقط بعد از زدن «🛒 شروع خرید» و دیدن شماره کارت قابل قبوله.\nاز منوی زیر شروع کنید:`,
-      mainMenuKb()
+      mainMenuKb(tgId)
     );
   }
 
@@ -2160,6 +2204,12 @@ async function handleCallback(cq) {
     dbRun(`UPDATE users SET state='idle', pending_gift_link=NULL, pending_star_count=NULL, admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`);
   }
 
+  // Delete broadcast message (available to everyone, even when bot is off)
+  if (data === "del_broadcast") {
+    try { await deleteMsg(chatId, msgId); } catch {}
+    return answer(cq.id, "🗑 پیام حذف شد.");
+  }
+
   // Channel membership check
   if (data === "check_member") {
     const mustChannels = dbAll("SELECT * FROM must_channels");
@@ -2218,13 +2268,7 @@ async function handleCallback(cq) {
       `🌟 از منوی زیر، سرویس موردنظرت رو انتخاب کن:\n` +
       `${SEPARATOR}\n` +
       `⚡️ سریع • امن • آسان`,
-      { reply_markup: { inline_keyboard: [
-        btnRow(BTN.success("🎁  خرید گیفت تلگرام", "menu_gift")),
-        btnRow(BTN.success("⭐️  خرید استار تلگرام", "menu_star")),
-        btnRow(BTN.success("👤  خرید ممبر", "menu_member")),
-        btnRow(BTN.primary("📦  سفارش‌های من", "menu_orders")),
-        btnRow(BTN.primary("💬  پشتیبانی", "menu_support")),
-      ]}}
+      mainMenuKb(tgId)
     );
     return answer(cq.id);
   }
@@ -2241,13 +2285,7 @@ async function handleCallback(cq) {
       `🌟 از منوی زیر، سرویس موردنظرت رو انتخاب کن:\n` +
       `${SEPARATOR}\n` +
       `⚡️ سریع • امن • آسان`,
-      { reply_markup: { inline_keyboard: [
-        btnRow(BTN.success("🎁  خرید گیفت تلگرام", "menu_gift")),
-        btnRow(BTN.success("⭐️  خرید استار تلگرام", "menu_star")),
-        btnRow(BTN.success("👤  خرید ممبر", "menu_member")),
-        btnRow(BTN.primary("📦  سفارش‌های من", "menu_orders")),
-        btnRow(BTN.primary("💬  پشتیبانی", "menu_support")),
-      ]}}
+      mainMenuKb(tgId)
     );
     return answer(cq.id);
   }
@@ -2386,6 +2424,53 @@ async function handleCallback(cq) {
     return answer(cq.id);
   }
 
+  // ===== Referral menu =====
+  if (data === "menu_ref") {
+    resetUserState(user.id);
+    const fresh = dbGet(`SELECT * FROM users WHERE id=${user.id}`);
+    let botUsername = globalThis.BOT_USERNAME;
+    if (!botUsername) { const me = await api("getMe"); botUsername = me.result?.username || "bot"; globalThis.BOT_USERNAME = botUsername; }
+    const link = `https://t.me/${botUsername}?start=${tgId}`;
+    const rc = refCountOf(user.id);
+    const text =
+      `🔥 <b>سیستم زیرمجموعه‌گیری فعال شد!</b> 🔥\n\n` +
+      `دوستاتو دعوت کن و استارز بگیر! 💸😎\n\n` +
+      `👤 به ازای هر نفر که با لینک دعوت تو وارد بشه، ۲ هزار تومان به حسابت اضافه میشه!\n\n` +
+      `هرچی زیرمجموعه بیشتر = استارز و گیفت بیشتر💰\n\n` +
+      `🔗 لینک دعوتتو بردار و برای دوستات بفرست؛ شاید همین الان اولین استارز منتظرته! 🚀\n\n` +
+      `${SEPARATOR}\n\n` +
+      `🔗 <b>لینک دعوت شما:</b>\n<code>${link}</code>\n\n` +
+      `👥 <b>زیرمجموعه‌های شما:</b> <code>${rc}</code>\n` +
+      `💰 <b>موجودی کیف پول:</b> <code>${fmtPrice(fresh?.wallet || 0)}</code> تومان`;
+    await editSmart(chatId, msgId, text, { reply_markup: { inline_keyboard: [
+      [BTN.neutral("🔙 بازگشت به منو", "menu_back")],
+    ]}});
+    return answer(cq.id);
+  }
+
+  // ===== Account / wallet menu =====
+  if (data === "menu_account") {
+    resetUserState(user.id);
+    const fresh = dbGet(`SELECT * FROM users WHERE id=${user.id}`);
+    const orderCount = dbGet(`SELECT COUNT(*) as c FROM orders WHERE user_id=${user.id}`)?.c || 0;
+    const rc = refCountOf(user.id);
+    const joinDate = fresh?.created_at ? new Date(fresh.created_at * 1000).toLocaleDateString("fa-IR") : "—";
+    const text =
+      `👤 <b>حساب کاربری</b>\n${SEPARATOR}\n\n` +
+      `🪪 <b>آیدی عددی:</b> <code>${tgId}</code>\n` +
+      `📛 <b>اسم:</b> ${esc(fresh?.first_name || "—")}\n` +
+      (fresh?.username ? `🔗 <b>یوزرنیم:</b> @${esc(fresh.username)}\n` : "") +
+      `📅 <b>عضویت:</b> ${joinDate}\n\n` +
+      `💳 <b>موجودی کیف پول:</b> <code>${fmtPrice(fresh?.wallet || 0)}</code> تومان\n` +
+      `👥 <b>زیرمجموعه‌ها:</b> <code>${rc}</code>\n` +
+      `📦 <b>تعداد سفارش‌ها:</b> <code>${orderCount}</code>`;
+    await editSmart(chatId, msgId, text, { reply_markup: { inline_keyboard: [
+      [BTN.success("زیر مجموعه گیری 👥", "menu_ref")],
+      [BTN.neutral("🔙 بازگشت به منو", "menu_back")],
+    ]}});
+    return answer(cq.id);
+  }
+
   // Gift selection from list
   if (data.startsWith("gift_select_")) {
     const giftId = parseInt(data.replace("gift_select_", ""));
@@ -2435,6 +2520,20 @@ async function handleCallback(cq) {
     return;
   }
 
+  // Admin panel quick access from user menu
+  if (data === "admin_panel_btn") {
+    if (!isAdmin(tgId)) return answer(cq.id, "شما ادمین نیستید.", true);
+    await adminMenu(chatId);
+    return answer(cq.id);
+  }
+
+  // Back to user home from admin panel
+  if (data === "user_home") {
+    dbRun(`UPDATE users SET state='idle', pending_gift_link=NULL, pending_star_count=NULL, admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`);
+    await editSmart(chatId, msgId, userHomeText(), mainMenuKb(tgId));
+    return answer(cq.id);
+  }
+
   // Admin callbacks (edit existing message)
   if (data === "admin_back") { if (isAdmin(tgId)) { const p = dbGet("SELECT COUNT(*) as c FROM orders WHERE status='pending_approval'")?.c || 0; const a = dbGet("SELECT COUNT(*) as c FROM orders WHERE status='approved'")?.c || 0; const t = dbGet("SELECT COUNT(*) as c FROM orders")?.c || 0; const co = dbGet("SELECT COUNT(*) as c FROM orders WHERE status='completed'")?.c || 0; const cn = dbGet("SELECT COUNT(*) as c FROM orders WHERE status='cancelled'")?.c || 0; const users = dbGet("SELECT COUNT(*) as c FROM users")?.c || 0; const gifts = dbGet("SELECT COUNT(*) as c FROM gifts WHERE is_active=1")?.c || 0; await edit(chatId, msgId, `💫 <b>══════════════════════</b>\n✨ <b>  ${BOT_NAME}  Panel  </b> ✨\n💫 <b>══════════════════════</b>\n\n📊 <b>آمار کلی</b>\n${SEPARATOR}\n🟠 <b>در انتظار تایید:</b>  <code>${p}</code>\n🟢 <b>تایید شده:</b>       <code>${a}</code>\n✅ <b>تکمیل شده:</b>       <code>${co}</code>\n📋 <b>کل سفارشات:</b>     <code>${t}</code>\n🚫 <b>لغو شده:</b>         <code>${cn}</code>\n👥 <b>کل کاربران:</b>      <code>${users}</code>\n🎁 <b>گیفت فعال:</b>       <code>${gifts}</code>\n${SEPARATOR}\n\nیکی از گزینه‌ها رو انتخاب کنید:`, { reply_markup: { inline_keyboard: [
         btnRow(BTN.danger(`🔍 در انتظار تایید  [${p}]`, "admin_pending")),
@@ -2450,6 +2549,7 @@ async function handleCallback(cq) {
         btnRow(BTN.info("📋 گزارش فیک", "admin_fake_report")),
         btnRow(BTN.primary("🔎 جستجوی سفارش", "admin_search")),
         btnRow(BTN.danger("⚠️ Danger Zone", "admin_danger")),
+        btnRow(BTN.neutral("🏠 منوی کاربری", "user_home")),
       ]}}); } return answer(cq.id); }
   if (data === "admin_pending") { if (isAdmin(tgId)) { const rows = dbAll("SELECT * FROM orders WHERE status='pending_approval' ORDER BY id DESC"); const ps = 5; const pages = Math.ceil(rows.length / ps); const pageRows = rows.slice(0, ps); let text = `📋 <b>سفارشات در انتظار تایید</b>\n${SEPARATOR}\n\n`; const nav = []; for (const o of pageRows) { const u = dbGet(`SELECT * FROM users WHERE id=${o.user_id}`); const d = new Date(o.created_at * 1000); const time = `${d.getHours().toString().padStart(2, "0")}:${d.getMinutes().toString().padStart(2, "0")}`; const tIcon = typeIcon(o.type); text += `🟠 <b><code>${o.code}</code></b>  ${tIcon}\n   👤 @${u?.username || "ندارد"}  •  ⭐ ${o.star_count}  •  💰 ${fmtPrice(o.price_toman)}\n   📅 ${d.toLocaleDateString("fa-IR")}  🕐 ${time}\n\n`; nav.push(btnRow(BTN.success(`✅ تایید ${o.code}`, `approve_${o.id}`))); } if (pages > 1) { const r = []; if (0 > 0) r.push({ text: "◀️", callback_data: "admin_page_pending_approval_0" }); r.push({ text: `📄 1/${pages}`, callback_data: "noop" }); if (0 < pages - 1) r.push({ text: "▶️", callback_data: "admin_page_pending_approval_1" }); nav.push(r); } nav.push([BTN.neutral("🔙 بازگشت", "admin_back")]); await edit(chatId, msgId, text, { reply_markup: { inline_keyboard: nav } }); } return answer(cq.id); }
   if (data === "admin_approved") { if (isAdmin(tgId)) { const rows = dbAll("SELECT * FROM orders WHERE status='approved' ORDER BY id DESC"); const ps = 5; const pages = Math.ceil(rows.length / ps); const pageRows = rows.slice(0, ps); let text = `📋 <b>سفارشات تایید شده</b>\n${SEPARATOR}\n\n`; const nav = []; for (const o of pageRows) { const u = dbGet(`SELECT * FROM users WHERE id=${o.user_id}`); const d = new Date(o.created_at * 1000); const time = `${d.getHours().toString().padStart(2, "0")}:${d.getMinutes().toString().padStart(2, "0")}`; const tIcon = typeIcon(o.type); text += `🟢 <b><code>${o.code}</code></b>  ${tIcon}\n   👤 @${u?.username || "ندارد"}  •  ⭐ ${o.star_count}  •  💰 ${fmtPrice(o.price_toman)}\n   📅 ${d.toLocaleDateString("fa-IR")}  🕐 ${time}\n\n`; nav.push(btnRow(BTN.success(`✅ تکمیل ${o.code}`, `complete_${o.id}`), BTN.danger(`🚫 لغو ${o.code}`, `cancel_${o.id}`))); } nav.push([BTN.neutral("🔙 بازگشت", "admin_back")]); await edit(chatId, msgId, text, { reply_markup: { inline_keyboard: nav } }); } return answer(cq.id); }
@@ -3112,7 +3212,7 @@ async function handleCallback(cq) {
       dbRun(`UPDATE orders SET status='cancelled', updated_at=unixepoch() WHERE id=${oId}`);
     }
     resetUserState(user.id);
-    await editSmart(chatId, msgId, `❌ <b>خرید لغو شد.</b>\nاز منوی زیر ادامه بدید:`, mainMenuKb());
+    await editSmart(chatId, msgId, `❌ <b>خرید لغو شد.</b>\nاز منوی زیر ادامه بدید:`, mainMenuKb(tgId));
     return answer(cq.id, "لغو شد");
   }
 
@@ -3372,6 +3472,7 @@ async function main() {
   const me = await api("getMe");
   if (!me.ok) { console.error("❌ Cannot connect:", me.description); process.exit(1); }
   console.log(`✅ Bot: @${me.result.username}`);
+  globalThis.BOT_USERNAME = me.result.username;
   await api("deleteWebhook");
   console.log("🔄 Polling started! Send /start to your bot.");
   poll();
