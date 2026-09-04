@@ -185,30 +185,6 @@ function mainMenuRows(tgId) {
 }
 function mainMenuKb(tgId) { return { reply_markup: { inline_keyboard: mainMenuRows(tgId) } }; }
 
-// ==================== Reply Keyboards ====================
-const REPLY_MAIN = [
-  ["🛍 خرید گیفت", "⭐ خرید استار", "👤 خرید ممبر بدون ریزش"],
-  ["👤 حساب کاربری", "👥 زیر مجموعه گیری"],
-  ["📦 سفارش های من", "🏠 منو اصلی"],
-];
-const REPLY_ADMIN = [
-  ["🛠 پنل"],
-  ["✅ تایید شده ها", "🟠 در انتظار ها"],
-  ["📢 پیام همگانی", "📣 فوروارد همگانی"],
-];
-const REPLY_CANCEL = [["❌ انصراف"]];
-
-function setReplyKeyboard(chatId, rows, text = "⌨️ از کیبورد زیر استفاده کنید:", persistent = true) {
-  return api("sendMessage", {
-    chat_id: chatId,
-    text,
-    reply_markup: { keyboard: rows, resize_keyboard: true, is_persistent: persistent },
-  });
-}
-function removeReplyKeyboard(chatId) {
-  return api("sendMessage", { chat_id: chatId, text: "⌨️ کیبورد مخفی شد — از دکمه‌های داخل پیام استفاده کنید.", reply_markup: { remove_keyboard: true } });
-}
-
 // ==================== Commands Menu (دکمه ☰ کنار چت) ====================
 const USER_MENU_CMDS = [
   { command: "start", description: "🏠 منوی اصلی" },
@@ -235,27 +211,6 @@ async function setupMenus() {
     try { await api("setMyCommands", { commands: ADMIN_MENU_CMDS, scope: { type: "chat", chat_id: adminId } }); } catch (e) { console.error("setMyCommands(admin):", e.message); }
   }
   console.log("☰ Commands menu set.");
-}
-
-// Map of pending admin input states to their cancel-button context
-function replyTextRouter(chatId, tgId, text) {
-  const t = text.trim();
-  if (t === "❌ انصراف") { return "cancel"; }
-  if (t === "🏠 منو اصلی" || t === "منو اصلی") return "home";
-  if (t === "🛍 خرید گیفت") return "gift";
-  if (t === "⭐ خرید استار" || t === "⭐️ خرید استار") return "star";
-  if (t === "👤 خرید ممبر بدون ریزش") return "member";
-  if (t === "👤 حساب کاربری" || t === "حساب کاربری👤 💳") return "account";
-  if (t === "👥 زیر مجموعه گیری" || t === "زیر مجموعه گیری 👥") return "ref";
-  if (t === "📦 سفارش های من") return "orders";
-  if (t === "🛠 پنل") return "panel";
-  if (t === "✅ تایید شده ها") return "approved";
-  if (t === "🟠 در انتظار ها") return "pending";
-  if (t === "📢 پیام همگانی") return "broadcast";
-  if (t === "📣 فوروارد همگانی") return "fwd_broadcast";
-  if (t === "/keyboard") return "kb_show";
-  if (t === "/keyboard_off") return "kb_hide";
-  return null;
 }
 
 function genFakeId() {
@@ -322,6 +277,7 @@ async function renderOrderDetail(chatId, oId, msgId = null, fromStatus = null) {
     rows.push(btnRow(BTN.success("✅ تکمیل", `complete_${o.id}`), BTN.danger("🚫 لغو", `cancel_${o.id}`)));
   else if (o.status === "cancelled")
     rows.push(btnRow(BTN.primary("♻️ بازگردانی به «تایید شده»", `restore_${o.id}`)));
+  if (u?.telegram_id) rows.push(btnRow(BTN.primary("💬 گفتگو با کاربر", `dm_to_${u.telegram_id}`)));
   rows.push([BTN.danger(o.fake ? "⚠️ فیک — خارج از آمار ✓" : "🏷️ علامت‌گذاری فیک", `toggle_fake_${o.id}`)]);
   rows.push([BTN.neutral("🔙 بازگشت", fromStatus ? `adm_page_${fromStatus}_0` : "admin_back")]);
 
@@ -376,7 +332,8 @@ function toJalali(date) {
 const DEFAULT_SETTINGS = {
   card_number: "0000-0000-0000-0000",
   card_holder_name: "نام صاحب کارت",
-  exchange_rate: "5000",
+  gift_star_rate: "5000",
+  star_buy_rate: "5000",
   member_price: "21000",
   support_username: "samimige16",
   bot_name: "Pepe Star",
@@ -390,6 +347,11 @@ function setSetting(key, value) {
   else dbRun(`INSERT INTO settings (key, value) VALUES ('${key}', '${v}')`);
 }
 const BOT_NAME = getSetting("bot_name") || "Pepe Star";
+// مهاجرت: نرخ استار قدیمی → دو نرخ جدا (گیفت / خرید استار)
+if (dbGet(`SELECT key FROM settings WHERE key='gift_star_rate'`) == null) setSetting("gift_star_rate", getSetting("exchange_rate") || "5000");
+if (dbGet(`SELECT key FROM settings WHERE key='star_buy_rate'`) == null) setSetting("star_buy_rate", getSetting("exchange_rate") || "5000");
+function getGiftRate() { return getNumSetting("gift_star_rate"); }
+function getStarRate() { return getNumSetting("star_buy_rate"); }
 function ensureUser(tgId, username, firstName) {
   let u = dbGet(`SELECT * FROM users WHERE telegram_id=${tgId}`);
   if (u) { dbRun(`UPDATE users SET username='${(username || u.username || "").replace(/'/g, "''")}', first_name='${(firstName || u.first_name || "").replace(/'/g, "''")}', updated_at=unixepoch() WHERE id=${u.id}`); return dbGet(`SELECT * FROM users WHERE id=${u.id}`); }
@@ -608,7 +570,7 @@ setInterval(cleanupOldOrders, 6 * 60 * 60 * 1000); // every 6 hours
 function settingsPanelKb() {
   return { reply_markup: { inline_keyboard: [
     [BTN.primary("💳 تغییر شماره کارت", "set_edit_card")],
-    [BTN.primary("💱 تغییر نرخ تبدیل", "set_edit_rate")],
+    [BTN.primary("🎁 نرخ استار گیفت", "set_edit_gift_rate"), BTN.primary("⭐ نرخ استار خرید", "set_edit_star_rate")],
     [BTN.primary("👤 تغییر قیمت ممبر", "set_edit_member")],
     [BTN.primary("💬 تغییر پشتیبان", "set_edit_support")],
     [BTN.primary("📣 تغییر کانال گزارش", "set_edit_log")],
@@ -636,7 +598,8 @@ function settingsPanelText() {
     `⚙️ <b>تنظیمات فعلی</b>\n${SEPARATOR}\n\n` +
     `💳 <b>شماره کارت:</b>  <code>${cn}</code>\n` +
     `👤 <b>صاحب کارت:</b>  ${ch}\n` +
-    `💱 <b>نرخ تبدیل:</b>  <code>${fmtPrice(getNumSetting("exchange_rate"))}</code> تومان/ستاره\n` +
+    `🎁 <b>نرخ استار گیفت:</b>  <code>${fmtPrice(getGiftRate())}</code> تومان/ستاره\n` +
+    `⭐ <b>نرخ استار خرید:</b>  <code>${fmtPrice(getStarRate())}</code> تومان/ستاره\n` +
     `👤 <b>قیمت ممبر (هر ۱۰۰):</b>  <code>${fmtPrice(getNumSetting("member_price"))}</code> تومان\n` +
     `💬 <b>پشتیبانی:</b>  @${sup}\n\n` +
     `📣 <b>کانال گزارشات:</b>  ${channel ? `<code>${channel.channel_id}</code> (${channel.channel_name || "-"})` : "❌ تنظیم نشده"}\n` +
@@ -867,7 +830,7 @@ function userHomeText() {
 
 // ==================== Shared screens (inline + reply keyboard) ====================
 async function screenStar(chatId, msgId = null) {
-  const rate = getNumSetting("exchange_rate");
+  const rate = getStarRate();
   const text =
     `⭐ <b>خرید استار تلگرام</b>\n${SEPARATOR}\n\n` +
     `💱 <b>نرخ هر ستاره:</b> <code>${fmtPrice(rate)}</code> تومان\n\n` +
@@ -1091,7 +1054,7 @@ async function showGiftList(chatId, msgId, page = 0) {
     );
     return;
   }
-  const rate = getNumSetting("exchange_rate");
+  const rate = getGiftRate();
   const perPage = 15;
   const totalPages = Math.ceil(gifts.length / perPage);
   const pageGifts = gifts.slice(page * perPage, (page + 1) * perPage);
@@ -1130,7 +1093,7 @@ async function showGiftListNew(chatId, page = 0) {
     );
     return;
   }
-  const rate = getNumSetting("exchange_rate");
+  const rate = getGiftRate();
   const perPage = 15;
   const totalPages = Math.ceil(gifts.length / perPage);
   const pageGifts = gifts.slice(page * perPage, (page + 1) * perPage);
@@ -1164,7 +1127,7 @@ async function giftEditCard(chatId, msgId, gid) {
     if (msgId) await editSmart(chatId, msgId, t, backKb); else await send(chatId, t, backKb);
     return;
   }
-  const rate = getNumSetting("exchange_rate");
+  const rate = getGiftRate();
   const price = g.star_count * rate;
   const text =
     `${g.emoji} <b>${g.name}</b>\n${SEPARATOR}\n\n` +
@@ -1355,51 +1318,6 @@ async function handleMessage(msg) {
   if (text === "/admin" || text === "/panel") { if (!isAdmin(tgId)) return send(chatId, "❌ <b>شما دسترسی ادمین ندارید.</b>"); dbRun(`UPDATE users SET admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`); await adminMenu(chatId); return; }
   if (text === "/pending") { if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید."); dbRun(`UPDATE users SET admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`); await showOrders(chatId, "pending_approval"); return; }
   if (text === "/orders") { if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید."); dbRun(`UPDATE users SET admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`); await showOrders(chatId, "all"); return; }
-
-  // ===== Reply keyboard router =====
-  const rk = replyTextRouter(chatId, tgId, text);
-  if (rk) {
-    if (rk === "cancel") {
-      const hadState = user.state !== "idle" || freshUser.admin_state;
-      dbRun(`UPDATE users SET state='idle', pending_gift_link=NULL, pending_star_count=NULL, admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE id=${user.id}`);
-      return send(chatId, hadState ? "↩️ <b>عملیات قبلی لغو شد.</b>" : "چیزی برای لغو نبود.", mainMenuKb(tgId));
-    }
-    if (rk === "kb_show") return setReplyKeyboard(chatId, isAdmin(tgId) ? [...REPLY_MAIN, ...REPLY_ADMIN] : REPLY_MAIN, "⌨️ کیبورد فعال شد.");
-    if (rk === "kb_hide") return removeReplyKeyboard(chatId);
-    // Anything typed on the reply keyboard acts like a fresh navigation
-    dbRun(`UPDATE users SET state='idle', pending_gift_link=NULL, pending_star_count=NULL, admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE id=${user.id}`);
-    if (rk === "home") return showMainMenu(chatId, tgId);
-    if (rk === "gift") return showGiftListNew(chatId, 0);
-    if (rk === "star") return screenStar(chatId);
-    if (rk === "member") return screenMember(chatId, tgId);
-    if (rk === "account") return screenAccount(chatId, tgId);
-    if (rk === "ref") return screenRef(chatId, tgId);
-    if (rk === "orders") return screenOrders(chatId, tgId);
-    if (rk === "panel") { if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید."); await adminMenu(chatId); return; }
-    if (rk === "approved") { if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید."); await showOrders(chatId, "approved"); return; }
-    if (rk === "pending") { if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید."); await showOrders(chatId, "pending_approval"); return; }
-    if (rk === "broadcast") {
-      if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید.");
-      dbRun(`UPDATE users SET admin_state='awaiting_broadcast', updated_at=unixepoch() WHERE telegram_id=${tgId}`);
-      await send(chatId,
-        `📢 <b>ارسال پیام همگانی</b>\n${SEPARATOR}\n\n` +
-        `پیامی که می‌خواهید به همه کاربران ارسال شه رو بنویسید:\n\n` +
-        `💡 از HTML استفاده کنید:\n` +
-        `<code>&lt;b&gt;بولد&lt;/b&gt;</code>\n` +
-        `<code>&lt;a href="url"&gt;لینک&lt;/a&gt;</code>`,
-        { reply_markup: { inline_keyboard: [[BTN.danger("انصراف", "admin_back")]] } }
-      );
-      return;
-    }
-    if (rk === "fwd_broadcast") { if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید."); await fwdChannelPicker(chatId, 0); return; }
-  }
-
-  // ===== First-time users get the reply keyboard =====
-  if (!user.kb_sent) {
-    const kbRows = isAdmin(tgId) ? [...REPLY_MAIN, ...REPLY_ADMIN] : REPLY_MAIN;
-    await setReplyKeyboard(chatId, kbRows, `👋 سلام ${esc(firstName)}!\n⌨️ از کیبورد زیر استفاده کنید یا لینک/عدد بفرستید.`);
-    dbRun(`UPDATE users SET kb_sent=1 WHERE id=${user.id}`);
-  }
 
   // === تشخیص کانال ===
   if (text === "/chaninfo") {
@@ -1619,7 +1537,7 @@ async function handleMessage(msg) {
 
     // Get cached image
     const imageFileId = globalThis.giftImageCache?.[captionNum] || null;
-    const rate = getNumSetting("exchange_rate");
+    const rate = getGiftRate();
     const price = starCount * rate;
 
     // Store preview data for confirmation
@@ -1732,13 +1650,17 @@ async function handleMessage(msg) {
     return;
   }
 
-  // Admin: Set exchange rate
+  // Admin: Set exchange rates — /setrate gift|star
   if (text.startsWith("/setrate")) {
     if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید.");
-    const rate = parseNum(text.replace("/setrate", "").trim());
-    if (isNaN(rate) || rate <= 0) return send(chatId, "📝 <b>فرمت:</b>\n<code>/setrate 5000</code>");
-    setSetting("exchange_rate", rate);
-    await send(chatId, `✅ <b>نرخ تبدیل بروزرسانی شد:</b>\nهر ستاره = <code>${fmtPrice(rate)}</code> تومان`);
+    const parts = text.replace("/setrate", "").trim().split(/\s+/);
+    if (parts.length < 2 || !["gift", "star"].includes(parts[0])) {
+      return send(chatId, "📝 <b>فرمت:</b>\n<code>/setrate gift 5000</code> — نرخ استار گیفت\n<code>/setrate star 5000</code> — نرخ استار خرید");
+    }
+    const rate = parseNum(parts[1]);
+    if (isNaN(rate) || rate <= 0) return send(chatId, "❌ عدد نامعتبر.");
+    if (parts[0] === "gift") { setSetting("gift_star_rate", rate); await send(chatId, `✅ <b>نرخ استار گیفت بروزرسانی شد:</b>\nهر ستاره = <code>${fmtPrice(rate)}</code> تومان`); }
+    else { setSetting("star_buy_rate", rate); await send(chatId, `✅ <b>نرخ استار خرید بروزرسانی شد:</b>\nهر ستاره = <code>${fmtPrice(rate)}</code> تومان`); }
     return;
   }
 
@@ -1871,6 +1793,48 @@ async function handleMessage(msg) {
     return;
   }
 
+  // Direct message — step 1: target received
+  if (user.admin_state === "dm_target") {
+    if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید.");
+    const raw = normalizeDigits(text).trim();
+    dbRun(`UPDATE users SET admin_state=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`);
+    if (!raw) { await send(chatId, "❌ ورودی خالی بود — لغو شد."); return; }
+    let tu = null;
+    if (raw.startsWith("@")) {
+      const uname = raw.slice(1).replace(/'/g, "''").toLowerCase();
+      tu = dbGet(`SELECT * FROM users WHERE LOWER(username)='${uname}'`);
+    } else if (/^\d+$/.test(raw)) {
+      tu = dbGet(`SELECT * FROM users WHERE telegram_id=${parseInt(raw)}`);
+    }
+    if (!tu) { await send(chatId, "❌ کاربری با این آیدی/یوزرنیم پیدا نشد — لغو شد."); return; }
+    dbRun(`UPDATE users SET admin_state='dm_text', admin_state_data='${tu.telegram_id}', updated_at=unixepoch() WHERE telegram_id=${tgId}`);
+    await send(chatId,
+      `💬 <b>گفتگو با کاربر</b>\n${SEPARATOR}\n\n` +
+      `👤 @${tu.username || "ندارد"} (${esc(tu.first_name || "—")})\n` +
+      `🆔 <code>${tu.telegram_id}</code>\n\n` +
+      `پیامت رو بفرست تا همین‌طور بهش ارسال شه.\n\n` +
+      `لغو: <code>/cancel</code>`,
+      { reply_markup: { inline_keyboard: [[BTN.danger("❌ انصراف", "admin_back")]] } }
+    );
+    return;
+  }
+
+  // Direct message — step 2: text received → send
+  if (user.admin_state === "dm_text") {
+    if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید.");
+    const targetTgId = parseInt(user.admin_state_data);
+    dbRun(`UPDATE users SET admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`);
+    if (!targetTgId) { await send(chatId, "⚠️ داده منقضی شد — دوباره از پنل شروع کنید."); return; }
+    if (text.startsWith("/")) { await send(chatId, "↩️ ارسال پیام لغو شد."); return; }
+    const r = await send(targetTgId,
+      `💬 <b>پیام از پشتیبانی</b>\n${SEPARATOR}\n\n${text}`,
+      { reply_markup: { inline_keyboard: [[BTN.danger("🗑 حذف پیام", "del_broadcast")]] } }
+    );
+    if (r.ok) await send(chatId, `✅ پیام به <code>${targetTgId}</code> ارسال شد.`);
+    else await send(chatId, `❌ ارسال ناموفق: <code>${esc(r.description || "?")}</code>\n(شاید کاربر بات رو بلاک کرده)`);
+    return;
+  }
+
   // Fake Report Wizard — star/member count received
   if (user.admin_state === "fr_count") {
     if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید.");
@@ -1884,7 +1848,7 @@ async function handleMessage(msg) {
     let count, price, typeLabel;
     if (type === "star") {
       count = n;
-      price = n * getNumSetting("exchange_rate");
+      price = n * getStarRate();
       typeLabel = "🌟 استارز تلگرام";
     } else {
       if (n < 100 || n % 100 !== 0) { await send(chatId, "❌ <b>تعداد ممبر باید مضرب ۱۰۰ و حداقل ۱۰۰ باشه — لغو شد.</b>"); return; }
@@ -1970,17 +1934,18 @@ async function handleMessage(msg) {
     return;
   }
 
-  // Awaiting exchange rate
-  if (user.admin_state === "set_awaiting_rate") {
+  // Awaiting exchange rates (gift / star-buy)
+  if (user.admin_state === "set_awaiting_gift_rate" || user.admin_state === "set_awaiting_star_rate") {
     if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید.");
+    const isGift = user.admin_state === "set_awaiting_gift_rate";
     const rate = parseNum(text.trim());
     dbRun(`UPDATE users SET admin_state=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`);
     if (isNaN(rate) || rate <= 0) {
       await send(chatId, `❌ عدد نامعتبر بود. عملیات لغو شد.`);
       return;
     }
-    setSetting("exchange_rate", rate);
-    await send(chatId, `✅ <b>نرخ تبدیل بروزرسانی شد.</b>`);
+    if (isGift) setSetting("gift_star_rate", rate); else setSetting("star_buy_rate", rate);
+    await send(chatId, `✅ <b>${isGift ? "نرخ استار گیفت" : "نرخ استار خرید"} بروزرسانی شد:</b>\nهر ستاره = <code>${fmtPrice(rate)}</code> تومان`);
     await send(chatId, settingsPanelText(), settingsPanelKb());
     return;
   }
@@ -2241,7 +2206,7 @@ async function handleMessage(msg) {
       const v = parseNum(normalizeDigits(text));
       if (!v || v <= 0) return send(chatId, "❌ عدد نامعتبر — دوباره بفرستید یا /cancel بزنید.");
       dbRun(`UPDATE gifts SET star_count=${v} WHERE id=${gid}`);
-      note = `\n💰 قیمت جدید: <code>${fmtPrice(v * getNumSetting("exchange_rate"))}</code> تومان`;
+      note = `\n💰 قیمت جدید: <code>${fmtPrice(v * getGiftRate())}</code> تومان`;
     } else if (field === "emoji") {
       const v = extractEmoji(text) || "🎁";
       dbRun(`UPDATE gifts SET emoji='${v.replace(/'/g, "''")}' WHERE id=${gid}`);
@@ -2369,7 +2334,7 @@ async function handleMessage(msg) {
     const sc = parseNum(normalizeDigits(text));
     if (isNaN(sc) || sc <= 0) return send(chatId, `❌ <b>لطفاً یک عدد معتبر وارد کنید.</b>\nمثال: <code>100</code>`);
     cancelStalePending(user.id);
-    const rate = getNumSetting("exchange_rate"), price = sc * rate, code = genCode();
+    const rate = getGiftRate(), price = sc * rate, code = genCode();
     dbRun(`INSERT INTO orders (code, user_id, gift_link, type, star_count, price_toman, status) VALUES ('${code}', ${user.id}, '${user.pending_gift_link.replace(/'/g, "''")}', 'gift', ${sc}, ${price}, 'pending')`);
     const o = dbGet(`SELECT * FROM orders WHERE code='${code}'`);
     dbRun(`UPDATE users SET state='idle', pending_gift_link=NULL, updated_at=unixepoch() WHERE id=${user.id}`);
@@ -2471,7 +2436,7 @@ async function handleMessage(msg) {
 
     if (sc) {
       cancelStalePending(user.id);
-      const rate = getNumSetting("exchange_rate"), price = sc * rate, code = genCode();
+      const rate = getGiftRate(), price = sc * rate, code = genCode();
       dbRun(`INSERT INTO orders (code, user_id, gift_link, gift_name, type, star_count, price_toman, status) VALUES ('${code}', ${user.id}, '${text.replace(/'/g, "''")}', '${giftName.replace(/'/g, "''")}', 'gift', ${sc}, ${price}, 'pending')`);
       const o = dbGet(`SELECT * FROM orders WHERE code='${code}'`);
       await send(chatId,
@@ -2499,7 +2464,7 @@ async function handleMessage(msg) {
     const sc = parseNum(normText);
     if (sc > 0 && sc <= 1000000) {
       cancelStalePending(user.id);
-      const rate = getNumSetting("exchange_rate"), price = sc * rate, code = genCode();
+      const rate = getStarRate(), price = sc * rate, code = genCode();
       dbRun(`INSERT INTO orders (code, user_id, gift_link, type, star_count, price_toman, status) VALUES ('${code}', ${user.id}, 'سفارش دستی', 'star', ${sc}, ${price}, 'pending')`);
       const o = dbGet(`SELECT * FROM orders WHERE code='${code}'`);
       await send(chatId,
@@ -2786,7 +2751,7 @@ async function handleCallback(cq) {
     const gift = dbGet(`SELECT * FROM gifts WHERE id=${giftId} AND is_active=1`);
     if (!gift) return answer(cq.id, "گیفت یافت نشد.", true);
     cancelStalePending(user.id);
-    const rate = getNumSetting("exchange_rate");
+    const rate = getGiftRate();
     const price = gift.star_count * rate;
     const code = genCode();
     dbRun(`INSERT INTO orders (code, user_id, gift_link, gift_name, type, star_count, price_toman, status) VALUES ('${code}', ${user.id}, 'سفارش گیفت', '${gift.name.replace(/'/g, "''")}', 'gift', ${gift.star_count}, ${price}, 'pending')`);
@@ -2854,8 +2819,9 @@ async function handleCallback(cq) {
         btnRow(BTN.primary("🎁 مدیریت گیفت‌ها", "admin_gifts")),
         btnRow(BTN.primary("⚙️ تنظیمات", "admin_settings")),
         btnRow(BTN.primary("📊 آمار", "admin_stats")),
-        btnRow(BTN.primary("📢 ارسال پیام همگانی", "admin_broadcast")),
-        btnRow(BTN.info("📋 گزارش فیک", "admin_fake_report")),
+      btnRow(BTN.primary("📢 ارسال پیام همگانی", "admin_broadcast")),
+      btnRow(BTN.primary("💬 پیام به کاربر", "admin_dm")),
+      btnRow(BTN.info("📋 گزارش فیک", "admin_fake_report")),
         btnRow(BTN.primary("🔎 جستجوی سفارش", "admin_search")),
         btnRow(BTN.danger("⚠️ Danger Zone", "admin_danger")),
         btnRow(BTN.neutral("🏠 منوی کاربری", "user_home")),
@@ -2929,7 +2895,7 @@ async function handleCallback(cq) {
     const imageFileId = globalThis.giftImageCache?.[captionNum] || null;
     const maxOrder = dbGet("SELECT MAX(sort_order) as m FROM gifts")?.m || 0;
     dbRun(`INSERT INTO gifts (name, emoji, star_count, gift_id, description, image_file_id, sort_order) VALUES ('${giftName.replace(/'/g, "''")}', '${emoji}', ${starCount}, '${captionNum.replace(/'/g, "''")}', ${desc ? `'${desc.replace(/'/g, "''")}'` : "NULL"}, ${imageFileId ? `'${imageFileId}'` : "NULL"}, ${maxOrder + 1})`);
-    const rate = getNumSetting("exchange_rate");
+    const rate = getGiftRate();
     const price = starCount * rate;
     if (imageFileId) {
       await edit(chatId, msgId, `✅ <b>گیفت ذخیره شد!</b>\n\n${emoji} <b>${giftName}</b> — ⭐ ${starCount} — 💰 ${fmtPrice(price)} تومان`);
@@ -3056,6 +3022,37 @@ async function handleCallback(cq) {
       `<code>&lt;b&gt;بولد&lt;/b&gt;</code>\n` +
       `<code>&lt;a href="url"&gt;لینک&lt;/a&gt;</code>`,
       { reply_markup: { inline_keyboard: [[BTN.danger("انصراف", "admin_back")]] } }
+    );
+    return answer(cq.id);
+  }
+
+  // ===== Direct message to one user — step 1: target =====
+  if (data === "admin_dm") {
+    if (!isAdmin(tgId)) return answer(cq.id);
+    dbRun(`UPDATE users SET admin_state='dm_target', updated_at=unixepoch() WHERE telegram_id=${tgId}`);
+    await send(chatId,
+      `💬 <b>پیام به کاربر</b>\n${SEPARATOR}\n\n` +
+      `آیدی عددی یا @یوزرنیم شخص رو بفرست:\n(مثال: <code>7184299507</code> یا <code>@username</code>)\n\n` +
+      `لغو: <code>/cancel</code>`,
+      { reply_markup: { inline_keyboard: [[BTN.danger("❌ انصراف", "admin_back")]] } }
+    );
+    return answer(cq.id);
+  }
+
+  // ===== Direct message — jump straight to text (از دکمه گفتگو) =====
+  if (data.startsWith("dm_to_")) {
+    if (!isAdmin(tgId)) return answer(cq.id);
+    const targetTgId = parseInt(data.replace("dm_to_", ""));
+    const tu = dbGet(`SELECT * FROM users WHERE telegram_id=${targetTgId}`);
+    if (!tu) return answer(cq.id, "کاربر یافت نشد.", true);
+    dbRun(`UPDATE users SET admin_state='dm_text', admin_state_data='${targetTgId}', updated_at=unixepoch() WHERE telegram_id=${tgId}`);
+    await send(chatId,
+      `💬 <b>گفتگو با کاربر</b>\n${SEPARATOR}\n\n` +
+      `👤 @${tu.username || "ندارد"} (${esc(tu.first_name || "—")})\n` +
+      `🆔 <code>${targetTgId}</code>\n\n` +
+      `پیامت رو بفرست تا همین‌طور بهش ارسال شه.\n\n` +
+      `لغو: <code>/cancel</code>`,
+      { reply_markup: { inline_keyboard: [[BTN.danger("❌ انصراف", "admin_back")]] } }
     );
     return answer(cq.id);
   }
@@ -3205,7 +3202,7 @@ async function handleCallback(cq) {
     const g = dbGet(`SELECT * FROM gifts WHERE id=${parseInt(data.replace("fr_gift_", ""))} AND is_active=1`);
     if (!g || !fakeId) return answer(cq.id, "منقضی شد — دوباره از منو شروع کنید.", true);
     dbRun(`UPDATE users SET admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`);
-    const rate = getNumSetting("exchange_rate");
+    const rate = getGiftRate();
     const ok = await sendFakeReport(chatId, {
       fakeId,
       typeLabel: `🎁 گیفت : ${g.emoji} ${esc(g.name)}`,
@@ -3298,14 +3295,15 @@ async function handleCallback(cq) {
     return answer(cq.id);
   }
 
-  // Edit exchange rate
-  if (data === "set_edit_rate") {
+  // Edit exchange rate — gift / star-buy
+  if (data === "set_edit_gift_rate" || data === "set_edit_star_rate") {
     if (!isAdmin(tgId)) return answer(cq.id);
-    dbRun(`UPDATE users SET admin_state='set_awaiting_rate', updated_at=unixepoch() WHERE telegram_id=${tgId}`);
+    const isGift = data === "set_edit_gift_rate";
+    dbRun(`UPDATE users SET admin_state='${isGift ? "set_awaiting_gift_rate" : "set_awaiting_star_rate"}', updated_at=unixepoch() WHERE telegram_id=${tgId}`);
     await send(chatId,
-      `💱 <b>تغییر نرخ تبدیل</b>\n${SEPARATOR}\n\n` +
-      `نرخ فعلی: <code>${fmtPrice(getNumSetting("exchange_rate"))}</code> تومان/ستاره\n\n` +
-      `📝 نرخ جدید (تومان به ازای هر ستاره) رو بفرستید:\n(مثال: <code>5000</code>)`,
+      `${isGift ? "🎁 <b>نرخ استار گیفت</b>" : "⭐ <b>نرخ استار خرید</b>"}\n${SEPARATOR}\n\n` +
+      `نرخ فعلی: <code>${fmtPrice(isGift ? getGiftRate() : getStarRate())}</code> تومان/ستاره\n\n` +
+      `📝 نرخ جدید رو بفرستید:\n(مثال: <code>5000</code>)`,
       { reply_markup: { inline_keyboard: [[BTN.danger("❌ انصراف", "admin_settings")]] } }
     );
     return answer(cq.id);
@@ -3564,6 +3562,7 @@ async function handleCallback(cq) {
       `💰 <b>مبلغ قابل پرداخت:</b>\n` +
       `<b><code>${fmtPrice(o.price_toman)} تومان</code></b>\n\n` +
       `${SEPARATOR}\n` +
+      `⏳ بعد از ارسال رسید، سفارشت توسط ادمین بررسی و تایید میشه — پس ممکنه پردازشش کمی طول بکشه.\n\n` +
       `📸 <b>مرحله بعد:</b> عکس رسید پرداخت رو بفرستید.`;
     // Dynamic back button based on order type (NULL-safe for legacy orders)
     const paymentKb = { reply_markup: { inline_keyboard: [
@@ -3591,7 +3590,7 @@ async function handleCallback(cq) {
     if (!sc || sc <= 0) return answer(cq.id, "عدد نامعتبر", true);
     cancelStalePending(user.id);
     resetUserState(user.id);
-    const rate = getNumSetting("exchange_rate"), price = sc * rate, code = genCode();
+    const rate = getStarRate(), price = sc * rate, code = genCode();
     dbRun(`INSERT INTO orders (code, user_id, gift_link, type, star_count, price_toman, status) VALUES ('${code}', ${user.id}, 'سفارش دستی', 'star', ${sc}, ${price}, 'pending')`);
     const o = dbGet(`SELECT * FROM orders WHERE code='${code}'`);
     await editSmart(chatId, msgId,
@@ -3627,6 +3626,7 @@ async function handleCallback(cq) {
     const cap = `🔔 <b>═══ سفارش جدید ═══</b>\n\n👤 <b>کاربر:</b> @${username || "ندارد"} (${firstName})\n🆔 <b>آیدی:</b> <code>${tgId}</code>\n📦 <b>نوع:</b> ${typeLabel}\n👀 <b>تعداد:</b> <code>${o.star_count}</code>${targetInfo}\n💰 <b>قیمت:</b> <code>${fmtPrice(o.price_toman)}</code> تومان\n🔑 <b>کد:</b> <code>${o.code}</code>`;
     const kb = { inline_keyboard: [
       btnRow(BTN.success("✅  تایید", `approve_${oId}`), BTN.danger("❌  رد", `rejectq_${oId}`)),
+      btnRow(BTN.primary(`💬 گفتگو با کاربر`, `dm_to_${tgId}`)),
     ]};
     for (const adminId of ADMIN_IDS) { if (o.receipt_file_id) await sendPhoto(adminId, o.receipt_file_id, cap, { reply_markup: kb }); else await send(adminId, cap, { reply_markup: kb }); }
     return answer(cq.id, "ارسال شد.");
