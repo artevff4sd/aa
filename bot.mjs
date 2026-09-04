@@ -97,11 +97,16 @@ try { dbRun("SELECT fake FROM orders LIMIT 1"); } catch { dbRun("ALTER TABLE ord
 // Referral & wallet columns
 try { dbRun("SELECT referred_by FROM users LIMIT 1"); } catch { dbRun("ALTER TABLE users ADD COLUMN referred_by INTEGER"); }
 try { dbRun("SELECT wallet FROM users LIMIT 1"); } catch { dbRun("ALTER TABLE users ADD COLUMN wallet INTEGER DEFAULT 0"); }
+try { dbRun("SELECT kb_sent FROM users LIMIT 1"); } catch { dbRun("ALTER TABLE users ADD COLUMN kb_sent INTEGER DEFAULT 0"); }
 
 // ==================== Referral ====================
 const REFERRAL_REWARD = 2000;
 const REFERRAL_CAP = 10;
 function refCountOf(userId) { return dbGet(`SELECT COUNT(*) as c FROM users WHERE referred_by=${userId}`)?.c || 0; }
+
+// Forward-broadcast channels + cached channel posts
+dbRun(`CREATE TABLE IF NOT EXISTS fwd_channels (id INTEGER PRIMARY KEY AUTOINCREMENT, channel_id INTEGER UNIQUE NOT NULL, channel_name TEXT, created_at INTEGER DEFAULT (unixepoch()))`);
+dbRun(`CREATE TABLE IF NOT EXISTS fwd_posts (id INTEGER PRIMARY KEY AUTOINCREMENT, channel_id INTEGER NOT NULL, message_id INTEGER NOT NULL, snippet TEXT, created_at INTEGER DEFAULT (unixepoch()), UNIQUE(channel_id, message_id))`);
 
 // App flags table (for stats epoch etc.)
 dbRun(`CREATE TABLE IF NOT EXISTS app_flags (key TEXT PRIMARY KEY, value TEXT)`);
@@ -179,6 +184,51 @@ function mainMenuRows(tgId) {
   return rows;
 }
 function mainMenuKb(tgId) { return { reply_markup: { inline_keyboard: mainMenuRows(tgId) } }; }
+
+// ==================== Reply Keyboards ====================
+const REPLY_MAIN = [
+  ["🛍 خرید گیفت", "⭐ خرید استار", "👤 خرید ممبر بدون ریزش"],
+  ["👤 حساب کاربری", "👥 زیر مجموعه گیری"],
+  ["📦 سفارش های من", "🏠 منو اصلی"],
+];
+const REPLY_ADMIN = [
+  ["🛠 پنل"],
+  ["✅ تایید شده ها", "🟠 در انتظار ها"],
+  ["📢 پیام همگانی", "📣 فوروارد همگانی"],
+];
+const REPLY_CANCEL = [["❌ انصراف"]];
+
+function setReplyKeyboard(chatId, rows, text = "⌨️ از کیبورد زیر استفاده کنید:", persistent = true) {
+  return api("sendMessage", {
+    chat_id: chatId,
+    text,
+    reply_markup: { keyboard: rows, resize_keyboard: true, is_persistent: persistent },
+  });
+}
+function removeReplyKeyboard(chatId) {
+  return api("sendMessage", { chat_id: chatId, text: "⌨️ کیبورد مخفی شد — از دکمه‌های داخل پیام استفاده کنید.", reply_markup: { remove_keyboard: true } });
+}
+
+// Map of pending admin input states to their cancel-button context
+function replyTextRouter(chatId, tgId, text) {
+  const t = text.trim();
+  if (t === "❌ انصراف") { return "cancel"; }
+  if (t === "🏠 منو اصلی" || t === "منو اصلی") return "home";
+  if (t === "🛍 خرید گیفت") return "gift";
+  if (t === "⭐ خرید استار" || t === "⭐️ خرید استار") return "star";
+  if (t === "👤 خرید ممبر بدون ریزش") return "member";
+  if (t === "👤 حساب کاربری" || t === "حساب کاربری👤 💳") return "account";
+  if (t === "👥 زیر مجموعه گیری" || t === "زیر مجموعه گیری 👥") return "ref";
+  if (t === "📦 سفارش های من") return "orders";
+  if (t === "🛠 پنل") return "panel";
+  if (t === "✅ تایید شده ها") return "approved";
+  if (t === "🟠 در انتظار ها") return "pending";
+  if (t === "📢 پیام همگانی") return "broadcast";
+  if (t === "📣 فوروارد همگانی") return "fwd_broadcast";
+  if (t === "/keyboard") return "kb_show";
+  if (t === "/keyboard_off") return "kb_hide";
+  return null;
+}
 
 function genFakeId() {
   const len = 8 + Math.floor(Math.random() * 2);
@@ -488,7 +538,7 @@ function rwStatusText(rw) {
 async function checkRailwayAlerts(reportChatId = null) {
   const rw = await getRailwayCredit();
   if (reportChatId) {
-    if (!rw.ok) await send(reportChatId, `❌ <b>دریافت کردیت Railway ناموفق:</b>\n<code>${esc(rw.reason || "")}</code>`);
+    if (!rw.ok) await send(reportChatId, `❌ وصل نشدم به Railway: <code>${esc(rw.reason || "")}</code>`);
     else await send(reportChatId, rwStatusText(rw));
   }
   if (!rw.ok) return;
@@ -536,6 +586,7 @@ function settingsPanelKb() {
     [BTN.primary("📣 تغییر کانال گزارش", "set_edit_log")],
     [BTN.primary("🖼️ تغییر کانال عکس", "set_edit_img")],
     [BTN.primary("📢 مدیریت کانال‌های الزامی", "set_edit_must")],
+    [BTN.primary("🔀 کانال‌های فوروارد", "set_edit_fwd")],
     [BTN.primary("📦 تغییر کانال بکاپ", "set_edit_backup")],
     [BTN.primary("🛰 کردیت Railway", "set_edit_railway")],
     [BTN.neutral("📦 بکاپ فوری", "backup_now")],
@@ -543,12 +594,15 @@ function settingsPanelKb() {
     [BTN.neutral("🔙 بازگشت", "admin_back")],
   ]}};
 }
+function fwdChannelsSummary() {
+  const list = dbAll("SELECT * FROM fwd_channels ORDER BY id ASC");
+  return list.length ? list.map(c => c.channel_name || c.channel_id).join(", ") : "❌ تنظیم نشده";
+}
 function settingsPanelText() {
   const cn = getSetting("card_number"), ch = getSetting("card_holder_name");
   const channel = dbGet("SELECT * FROM channels WHERE is_active=1");
   const imgChannel = dbGet("SELECT * FROM img_channel LIMIT 1");
-  const mustChannels = dbAll("SELECT * FROM must_channels ORDER BY id ASC");
-  const sup = (getSetting("support_username") || DEFAULT_SETTINGS.support_username).replace(/^@/, "");
+  const mustChannels = dbAll("SELECT * FROM must_channels ORDER BY id ASC");  const sup = (getSetting("support_username") || DEFAULT_SETTINGS.support_username).replace(/^@/, "");
   const th = rwThresholds();
   return (
     `⚙️ <b>تنظیمات فعلی</b>\n${SEPARATOR}\n\n` +
@@ -560,6 +614,7 @@ function settingsPanelText() {
     `📣 <b>کانال گزارشات:</b>  ${channel ? `<code>${channel.channel_id}</code> (${channel.channel_name || "-"})` : "❌ تنظیم نشده"}\n` +
     `🖼️ <b>کانال عکس گیفت‌ها:</b>  ${imgChannel ? `<code>${imgChannel.channel_id}</code> (${imgChannel.channel_name || "-"})` : "❌ تنظیم نشده"}\n` +
     `📢 <b>کانال‌های الزامی:</b>  ${mustChannels.length ? mustChannels.map(c => c.channel_name || c.channel_id).join(", ") : "❌ تنظیم نشده"}\n` +
+    `🔀 <b>کانال‌های فوروارد:</b>  ${fwdChannelsSummary()}\n` +
     `📦 <b>کانال بکاپ خودکار:</b>  ${getSetting("backup_channel") ? `<code>${esc(getSetting("backup_channel"))}</code> (هر ۵ ساعت)` : "❌ تنظیم نشده"}\n` +
     `🛰 <b>کردیت Railway:</b>  ${rwTokenMasked()}\n\n` +
     `${SEPARATOR}\nروی دکمه مورد نظر بزنید:`
@@ -592,8 +647,8 @@ async function railwayPanelText() {
 }
 function railwayPanelKb() {
   return { reply_markup: { inline_keyboard: [
-    [BTN.primary("🔑 تنظیم توکن", "set_edit_rw_token")],
-    [BTN.primary("🪪 تنظیم ورک‌اسپیس", "set_edit_rw_wid")],
+    [BTN.primary("🔑 توکن", "set_edit_rw_token")],
+    [BTN.primary("🪪 ورک‌اسپیس", "set_edit_rw_wid")],
     [BTN.primary("📅 حد هشدار روز", "set_edit_rw_days"), BTN.primary("💵 حد هشدار کردیت", "set_edit_rw_credit")],
     [BTN.neutral("🔄 بررسی الان", "rw_check")],
     [BTN.neutral("🔙 بازگشت به تنظیمات", "admin_settings")],
@@ -654,12 +709,122 @@ async function adminMenu(chatId) {
       btnRow(BTN.primary("⚙️ تنظیمات", "admin_settings")),
       btnRow(BTN.primary("📊 آمار", "admin_stats")),
       btnRow(BTN.primary("📢 ارسال پیام همگانی", "admin_broadcast")),
+      btnRow(BTN.primary("📣 فوروارد همگانی", "admin_fwd")),
       btnRow(BTN.info("📋 گزارش فیک", "admin_fake_report")),
       btnRow(BTN.primary("🔎 جستجوی سفارش", "admin_search")),
       btnRow(BTN.danger("⚠️ Danger Zone", "admin_danger")),
       btnRow(BTN.neutral("🏠 منوی کاربری", "user_home")),
     ]}}
   );
+}
+
+// ==================== Forward Broadcast ====================
+async function fwdChannelPicker(chatId, msgId = null) {
+  const chans = dbAll("SELECT * FROM fwd_channels ORDER BY id ASC");
+  if (!chans.length) {
+    const text =
+      `📣 <b>فوروارد همگانی</b>\n${SEPARATOR}\n\n` +
+      `📭 هنوز کانالی برای فوروارد ثبت نشده.\n\n` +
+      `اول از تنظیمات ← «کانال‌های فوروارد» کانال اصلیت رو اضافه کن.\n` +
+      `📌 ربات باید ادمین کانال باشه تا پیام‌های جدیدش رو ببینه.`;
+    const kb = { reply_markup: { inline_keyboard: [
+      [BTN.primary("⚙️ تنظیم کانال‌های فوروارد", "set_edit_fwd")],
+      [BTN.neutral("🔙 بازگشت", "admin_back")],
+    ]}};
+    if (msgId) await editSmart(chatId, msgId, text, kb); else await send(chatId, text, kb);
+    return;
+  }
+  let text = `📣 <b>فوروارد همگانی</b>\n${SEPARATOR}\n\nاز کدوم کانال می‌خوای فوروارد کنی؟`;
+  const rows = chans.map(c => [BTN.primary(`📢 ${c.channel_name || c.channel_id}`, `fwd_ch_${c.channel_id}`)]);
+  rows.push([BTN.primary("➕ افزودن کانال جدید", "set_edit_fwd")]);
+  rows.push([BTN.neutral("🔙 بازگشت", "admin_back")]);
+  const kb = { reply_markup: { inline_keyboard: rows } };
+  if (msgId) await editSmart(chatId, msgId, text, kb); else await send(chatId, text, kb);
+}
+
+async function fwdPostPicker(chatId, msgId, channelId) {
+  const chan = dbGet(`SELECT * FROM fwd_channels WHERE channel_id=${channelId}`);
+  if (!chan) return fwdChannelPicker(chatId, msgId);
+  const posts = dbAll(`SELECT * FROM fwd_posts WHERE channel_id=${channelId} ORDER BY id DESC LIMIT 10`);
+  let text = `📢 <b>${esc(chan.channel_name || channelId)}</b>\n${SEPARATOR}\n\n`;
+  if (!posts.length) {
+    text += `📭 هنوز پیامی از این کانال ثبت نشده.\n\n` +
+      `💡 بات فقط پیام‌های <b>جدید</b> کانال رو می‌بینه (بعد از ثبت کانال).\n` +
+      `یک پست توی کانال بذار تا لیست بشه؛ بعد دوباره اینجا برگرد.`;
+  } else {
+    text += `۱۰ پیام آخر کانال — روی پیام موردنظر بزن:\n\n`;
+    for (const p of posts) {
+      const d = new Date(p.created_at * 1000);
+      text += `🆔 <code>${p.message_id}</code> • ${d.toLocaleDateString("fa-IR")} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}\n   ${p.snippet || "—"}\n\n`;
+    }
+  }
+  const rows = posts.map(p => [BTN.primary(`${(p.snippet || "—").slice(0, 40)}`, `fwd_pick_${channelId}_${p.message_id}`)]);
+  rows.push([BTN.neutral("🔙 بازگشت", "admin_fwd")]);
+  await editSmart(chatId, msgId, text, { reply_markup: { inline_keyboard: rows } });
+}
+
+async function fwdPostConfirm(chatId, msgId, channelId, messageId) {
+  const chan = dbGet(`SELECT * FROM fwd_channels WHERE channel_id=${channelId}`);
+  const post = dbGet(`SELECT * FROM fwd_posts WHERE channel_id=${channelId} AND message_id=${messageId}`);
+  if (!chan || !post) return fwdPostPicker(chatId, msgId, channelId);
+  const userCount = dbGet("SELECT COUNT(*) as c FROM users")?.c || 0;
+  const text =
+    `📣 <b>فوروارد به همه</b>\n${SEPARATOR}\n\n` +
+    `📢 <b>کانال:</b> ${esc(chan.channel_name || channelId)}\n` +
+    `🆔 <b>پیام:</b> <code>${messageId}</code>\n` +
+    `📝 <b>متن:</b> ${post.snippet || "—"}\n\n` +
+    `👥 <b>گیرندگان:</b> <code>${userCount}</code> کاربر\n\n` +
+    `❓ پیام مستقیم (فوروارد با نام کانال) برای همه ارسال بشه؟`;
+  await editSmart(chatId, msgId, text, { reply_markup: { inline_keyboard: [
+    [BTN.success("✅ ارسال به همه", `fwd_go_${channelId}_${messageId}`)],
+    [BTN.danger("❌ انصراف", `fwd_ch_${channelId}`)],
+  ]}});
+}
+
+async function fwdPostSend(chatId, msgId, channelId, messageId) {
+  await editSmart(chatId, msgId, `📤 <b>در حال فوروارد...</b>`);
+  const users = dbAll("SELECT telegram_id FROM users");
+  let sent = 0, failed = 0;
+  for (const u of users) {
+    try {
+      const r = await api("forwardMessage", { chat_id: u.telegram_id, from_chat_id: channelId, message_id: messageId });
+      if (r.ok) sent++; else failed++;
+    } catch { failed++; }
+  }
+  await editSmart(chatId, msgId,
+    `📣 <b>فوروارد همگانی انجام شد!</b>\n${SEPARATOR}\n\n` +
+    `✅ موفق: <code>${sent}</code>\n❌ ناموفق: <code>${failed}</code>\n\n` +
+    `💡 چون پیام به‌صورت فوروارد ارسال شده، ایموجی‌های پرمیوم حفظ میشن.`,
+    { reply_markup: { inline_keyboard: [
+      [BTN.neutral("🔁 فوروارد پیام دیگه", `fwd_ch_${channelId}`)],
+      [BTN.neutral("🔙 بازگشت به پنل", "admin_back")],
+    ]}}
+  );
+}
+
+// Forward channels management panel
+async function fwdChannelsPanel(chatId, msgId = null) {
+  const list = dbAll("SELECT * FROM fwd_channels ORDER BY id ASC");
+  let text = `🔀 <b>کانال‌های فوروارد</b>\n${SEPARATOR}\n\n`;
+  const buttons = [];
+  if (list.length) {
+    for (const c of list) {
+      const cnt = dbGet(`SELECT COUNT(*) as c FROM fwd_posts WHERE channel_id=${c.channel_id}`)?.c || 0;
+      text += `• <b>${esc(c.channel_name || c.channel_id)}</b> — <code>${c.channel_id}</code> (${cnt} پیام کش‌شده)\n`;
+      buttons.push([BTN.danger(`🗑️ حذف ${c.channel_name || c.channel_id}`, `set_fwd_remove_${c.channel_id}`)]);
+    }
+    text += `\n`;
+  } else {
+    text += `📭 هیچ کانالی ثبت نشده.\n\n`;
+  }
+  text += `${SEPARATOR}\n` +
+    `📝 کانال اصلیت رو اضافه کن تا بتونی پست‌هاش رو مستقیم به همه کاربران فوروارد کنی.\n` +
+    `📌 ربات باید <b>ادمین کانال</b> باشه (دسترسی خواندن پیام).\n` +
+    `💡 فقط پیام‌های جدید بعد از ثبت کانال لیست میشن.`;
+  buttons.push([BTN.success("➕ افزودن کانال", "set_fwd_add")]);
+  buttons.push([BTN.neutral("🔙 بازگشت به تنظیمات", "admin_settings")]);
+  const kb = { reply_markup: { inline_keyboard: buttons } };
+  if (msgId) await editSmart(chatId, msgId, text, kb); else await send(chatId, text, kb);
 }
 
 // User home (from admin panel)
@@ -670,6 +835,116 @@ function userHomeText() {
     `🌟 از منوی زیر، سرویس موردنظرت رو انتخاب کن:\n` +
     `${SEPARATOR}\n` +
     `⚡️ سریع • امن • آسان`;
+}
+
+// ==================== Shared screens (inline + reply keyboard) ====================
+async function screenStar(chatId, msgId = null) {
+  const rate = getNumSetting("exchange_rate");
+  const text =
+    `⭐ <b>خرید استار تلگرام</b>\n${SEPARATOR}\n\n` +
+    `💱 <b>نرخ هر ستاره:</b> <code>${fmtPrice(rate)}</code> تومان\n\n` +
+    `${SEPARATOR}\n\n` +
+    `تعداد ستاره مورد نظرتون رو بنویسید:\n` +
+    `(مثال: <code>100</code>, <code>500</code>, <code>1000</code>)`;
+  const kb = { reply_markup: { inline_keyboard: [
+    [BTN.success("⭐ 50", "star_q_50"), BTN.success("⭐ 100", "star_q_100"), BTN.success("⭐ 250", "star_q_250")],
+    [BTN.success("⭐ 500", "star_q_500"), BTN.success("⭐ 1000", "star_q_1000")],
+    [BTN.neutral("🔙 بازگشت به منو", "menu_back")],
+  ]}};
+  if (msgId) await editSmart(chatId, msgId, text, kb); else await send(chatId, text, kb);
+}
+async function screenMember(chatId, tgId, msgId = null) {
+  const memberPrice = getNumSetting("member_price");
+  const pricePer100 = fmtPrice(memberPrice);
+  const text =
+    `👤 <b>خرید ممبر بدون ریزش</b>\n${SEPARATOR}\n\n` +
+    `تکمیلی سریع ⚡️\n` +
+    `هدف : کانال | گروه 📍\n` +
+    `کنسل ندارد ●\n` +
+    `قیمت هر ۱۰۰ ممبر : <code>${pricePer100}</code> تومان 💸\n` +
+    `حداقل سفارش : ۱۰۰ عدد\n\n` +
+    `${SEPARATOR}\n\n` +
+    `🔹 تعداد مورد نظر خود را از بین ۱۰۰ تا ۱٬۰۰۰ انتخاب کنید:` +
+    (isAdmin(tgId) ? `\n\n📋 <b>گزارش فیک (ادمین):</b> دکمه‌های پایین — همون گزارش بخش خرید رو با اون تعداد به کانال گزارش ارسال می‌کنه.` : "");
+  const kb = { reply_markup: { inline_keyboard: [
+    [BTN.success("100", "member_count_100"), BTN.success("250", "member_count_250"), BTN.success("500", "member_count_500")],
+    [BTN.success("750", "member_count_750"), BTN.success("1000", "member_count_1000")],
+    ...(isAdmin(tgId) ? [
+      [BTN.primary("📋 گزارش فیک 100", "frq_member_100"), BTN.primary("📋 گزارش فیک 250", "frq_member_250"), BTN.primary("📋 گزارش فیک 500", "frq_member_500")],
+      [BTN.primary("📋 گزارش فیک 750", "frq_member_750"), BTN.primary("📋 گزارش فیک 1000", "frq_member_1000")],
+    ] : []),
+    [BTN.neutral("🔙 بازگشت به منو", "menu_back")],
+  ]}};
+  if (msgId) await editSmart(chatId, msgId, text, kb); else await send(chatId, text, kb);
+}
+async function screenAccount(chatId, tgId, msgId = null) {
+  const u = dbGet(`SELECT * FROM users WHERE telegram_id=${tgId}`);
+  if (!u) return send(chatId, "❌ کاربر یافت نشد.");
+  const orderCount = dbGet(`SELECT COUNT(*) as c FROM orders WHERE user_id=${u.id}`)?.c || 0;
+  const rc = refCountOf(u.id);
+  const joinDate = u.created_at ? new Date(u.created_at * 1000).toLocaleDateString("fa-IR") : "—";
+  const text =
+    `👤 <b>حساب کاربری</b>\n${SEPARATOR}\n\n` +
+    `🪪 <b>آیدی عددی:</b> <code>${tgId}</code>\n` +
+    `📛 <b>اسم:</b> ${esc(u.first_name || "—")}\n` +
+    (u.username ? `🔗 <b>یوزرنیم:</b> @${esc(u.username)}\n` : "") +
+    `📅 <b>عضویت:</b> ${joinDate}\n\n` +
+    `💳 <b>موجودی کیف پول:</b> <code>${fmtPrice(u.wallet || 0)}</code> تومان\n` +
+    `👥 <b>زیرمجموعه‌ها:</b> <code>${rc}</code>\n` +
+    `📦 <b>تعداد سفارش‌ها:</b> <code>${orderCount}</code>`;
+  const kb = { reply_markup: { inline_keyboard: [
+    [BTN.success("زیر مجموعه گیری 👥", "menu_ref")],
+    [BTN.neutral("🔙 بازگشت به منو", "menu_back")],
+  ]}};
+  if (msgId) await editSmart(chatId, msgId, text, kb); else await send(chatId, text, kb);
+}
+async function screenRef(chatId, tgId, msgId = null) {
+  const u = dbGet(`SELECT * FROM users WHERE telegram_id=${tgId}`);
+  if (!u) return send(chatId, "❌ کاربر یافت نشد.");
+  let botUsername = globalThis.BOT_USERNAME;
+  if (!botUsername) { const me = await api("getMe"); botUsername = me.result?.username || "bot"; globalThis.BOT_USERNAME = botUsername; }
+  const link = `https://t.me/${botUsername}?start=${tgId}`;
+  const rc = refCountOf(u.id);
+  const text =
+    `🔥 <b>سیستم زیرمجموعه‌گیری فعال شد!</b> 🔥\n\n` +
+    `دوستاتو دعوت کن و استارز بگیر! 💸😎\n\n` +
+    `👤 به ازای هر نفر که با لینک دعوت تو وارد بشه، ۲ هزار تومان به حسابت اضافه میشه!\n\n` +
+    `هرچی زیرمجموعه بیشتر = استارز و گیفت بیشتر💰\n\n` +
+    `🔗 لینک دعوتتو بردار و برای دوستات بفرست؛ شاید همین الان اولین استارز منتظرته! 🚀\n\n` +
+    `${SEPARATOR}\n\n` +
+    `🔗 <b>لینک دعوت شما:</b>\n<code>${link}</code>\n\n` +
+    `👥 <b>زیرمجموعه‌های شما:</b> <code>${rc}</code>\n` +
+    `💰 <b>موجودی کیف پول:</b> <code>${fmtPrice(u.wallet || 0)}</code> تومان`;
+  const kb = { reply_markup: { inline_keyboard: [
+    [BTN.neutral("🔙 بازگشت به منو", "menu_back")],
+  ]}};
+  if (msgId) await editSmart(chatId, msgId, text, kb); else await send(chatId, text, kb);
+}
+async function screenOrders(chatId, tgId, msgId = null) {
+  const u = dbGet(`SELECT * FROM users WHERE telegram_id=${tgId}`);
+  if (!u) return send(chatId, "❌ کاربر یافت نشد.");
+  const rows = dbAll(`SELECT * FROM orders WHERE user_id=${u.id} ORDER BY id DESC LIMIT 10`);
+  if (!rows.length) {
+    const text = `📦 <b>سفارش‌های من</b>\n${SEPARATOR}\n\n📭 <b>هنوز سفارشی ثبت نکردید.</b>\n\nاز منوی اصلی خرید کنید!`;
+    const kb = { reply_markup: { inline_keyboard: [[BTN.neutral("🔙 بازگشت به منو", "menu_back")]] } };
+    if (msgId) await editSmart(chatId, msgId, text, kb); else await send(chatId, text, kb);
+    return;
+  }
+  const si = { pending: "🟡", receipt_sent: "🔵", pending_approval: "🟠", approved: "🟢", rejected: "🔴", completed: "✅", cancelled: "⚫" };
+  const sf = { pending: "در انتظار رسید", receipt_sent: "رسید ارسال شده", pending_approval: "در انتظار تایید", approved: "تایید شده", rejected: "رد شده", completed: "تکمیل شده", cancelled: "لغو شده" };
+  let text = `📦 <b>سفارش‌های من</b>\n${SEPARATOR}\n\n`;
+  for (const o of rows) {
+    const icon = si[o.status] || "❓";
+    const tIcon = typeIcon(o.type);
+    const d = new Date(o.created_at * 1000);
+    const time = `${d.getHours().toString().padStart(2, "0")}:${d.getMinutes().toString().padStart(2, "0")}`;
+    text += `${icon} <b><code>${o.code}</code></b> ${tIcon}\n`;
+    text += `   📊 ${sf[o.status] || o.status}\n`;
+    text += `   💰 ${fmtPrice(o.price_toman)} تومان  •  ${countLabel(o.type)}: <code>${o.star_count}</code>\n`;
+    text += `   📅 ${d.toLocaleDateString("fa-IR")}  🕐 ${time}\n\n`;
+  }
+  const kb = { reply_markup: { inline_keyboard: [[BTN.neutral("🔙 بازگشت به منو", "menu_back")]] } };
+  if (msgId) await editSmart(chatId, msgId, text, kb); else await send(chatId, text, kb);
 }
 
 async function showOrders(chatId, status, page = 0) {
@@ -949,15 +1224,13 @@ async function statsRender(chatId, msgId, period) {
   const rw = await getRailwayCredit();
   if (rw.ok) {
     creditTxt =
-      `\n💳 <b>کردیت Railway</b>\n` +
-      `• باقی‌مانده: <b>$${rw.credit.toFixed(2)}</b>` +
-      (rw.usage ? ` — مصرف این دوره: $${rw.usage.toFixed(2)}` : "") +
-      (rw.trialing ? ` (تریال — ${rw.trialDays} روز باقی)` : "") +
-      (rw.periodEnd ? `\n• پایان دوره: ${toJalali(new Date(rw.periodEnd))}` : "") + "\n";
+      `💳 <b>Railway:</b> $${rw.credit.toFixed(2)} مونده` +
+      (rw.usage ? ` — مصرف $${rw.usage.toFixed(2)}` : "") +
+      (rw.trialing ? ` — تریال، ${rw.trialDays} روز مونده` : "") + "\n";
   } else if (rw.reason === "no_token") {
-    creditTxt = `\n💳 کردیت Railway: ❌ توکن تنظیم نشده (RAILWAY_API_TOKEN)\n`;
+    creditTxt = `💳 Railway: توکن ست نشده (تنظیمات ← کردیت Railway)\n`;
   } else {
-    creditTxt = `\n💳 کردیت Railway: ⚠️ دریافت ناموفق (${esc(rw.reason)})\n`;
+    creditTxt = `💳 Railway: ⚠️ وصل نشدم (${esc(rw.reason)})\n`;
   }
 
   const text =
@@ -992,20 +1265,12 @@ async function statsRender(chatId, msgId, period) {
 
 // ==================== Main Menu ====================
 async function showMainMenu(chatId, tgId) {
-  await send(chatId,
-    `✨ <b>${BOT_NAME} Bot</b> ✨\n` +
-    `🎁 خرید گیفت و استار تلگرام\n` +
-    `${SEPARATOR}\n` +
-    `🌟 از منوی زیر، سرویس موردنظرت رو انتخاب کن:\n` +
-    `${SEPARATOR}\n` +
-    `⚡️ سریع • امن • آسان`,
-    mainMenuKb(tgId)
-  );
+  await send(chatId, userHomeText(), mainMenuKb(tgId));
 }
 
 // ==================== Message Handler ====================
 async function handleMessage(msg) {
-  // Handle channel posts (for gift images)
+  // Handle channel posts (for gift images + forward-broadcast caching)
   if (msg.chat.type === "channel" || msg.sender_chat) {
     const imgChannel = dbGet("SELECT * FROM img_channel LIMIT 1");
     if (imgChannel && msg.chat.id === imgChannel.channel_id && msg.photo && msg.caption) {
@@ -1017,6 +1282,23 @@ async function handleMessage(msg) {
         console.log(`📸 Gift image cached: caption=${captionNum}, file_id=${fileId.substring(0, 20)}...`);
       }
     }
+    // Cache posts of forward-broadcast channels (last 30 per channel)
+    try {
+      const fc = dbGet(`SELECT id FROM fwd_channels WHERE channel_id=${msg.chat.id}`);
+      if (fc && msg.message_id) {
+        let snippet;
+        if (msg.text) snippet = msg.text;
+        else if (msg.caption) snippet = msg.caption;
+        else if (msg.photo) snippet = "🖼 عکس";
+        else if (msg.video) snippet = "🎬 ویدیو";
+        else if (msg.animation) snippet = "🎞 گیف";
+        else if (msg.voice || msg.audio) snippet = "🎤 صدا";
+        else snippet = "📎 رسانه";
+        snippet = esc(String(snippet)).replace(/\s+/g, " ").slice(0, 60);
+        dbRun(`INSERT OR REPLACE INTO fwd_posts (channel_id, message_id, snippet) VALUES (${msg.chat.id}, ${msg.message_id}, '${snippet.replace(/'/g, "''")}')`);
+        dbRun(`DELETE FROM fwd_posts WHERE channel_id=${msg.chat.id} AND id NOT IN (SELECT id FROM fwd_posts WHERE channel_id=${msg.chat.id} ORDER BY id DESC LIMIT 30)`);
+      }
+    } catch (e) { console.error("fwd_posts cache error:", e.message); }
     return;
   }
 
@@ -1045,6 +1327,51 @@ async function handleMessage(msg) {
   if (text === "/admin" || text === "/panel") { if (!isAdmin(tgId)) return send(chatId, "❌ <b>شما دسترسی ادمین ندارید.</b>"); dbRun(`UPDATE users SET admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`); await adminMenu(chatId); return; }
   if (text === "/pending") { if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید."); dbRun(`UPDATE users SET admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`); await showOrders(chatId, "pending_approval"); return; }
   if (text === "/orders") { if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید."); dbRun(`UPDATE users SET admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`); await showOrders(chatId, "all"); return; }
+
+  // ===== Reply keyboard router =====
+  const rk = replyTextRouter(chatId, tgId, text);
+  if (rk) {
+    if (rk === "cancel") {
+      const hadState = user.state !== "idle" || freshUser.admin_state;
+      dbRun(`UPDATE users SET state='idle', pending_gift_link=NULL, pending_star_count=NULL, admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE id=${user.id}`);
+      return send(chatId, hadState ? "↩️ <b>عملیات قبلی لغو شد.</b>" : "چیزی برای لغو نبود.", mainMenuKb(tgId));
+    }
+    if (rk === "kb_show") return setReplyKeyboard(chatId, isAdmin(tgId) ? [...REPLY_MAIN, ...REPLY_ADMIN] : REPLY_MAIN, "⌨️ کیبورد فعال شد.");
+    if (rk === "kb_hide") return removeReplyKeyboard(chatId);
+    // Anything typed on the reply keyboard acts like a fresh navigation
+    dbRun(`UPDATE users SET state='idle', pending_gift_link=NULL, pending_star_count=NULL, admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE id=${user.id}`);
+    if (rk === "home") return showMainMenu(chatId, tgId);
+    if (rk === "gift") return showGiftListNew(chatId, 0);
+    if (rk === "star") return screenStar(chatId);
+    if (rk === "member") return screenMember(chatId, tgId);
+    if (rk === "account") return screenAccount(chatId, tgId);
+    if (rk === "ref") return screenRef(chatId, tgId);
+    if (rk === "orders") return screenOrders(chatId, tgId);
+    if (rk === "panel") { if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید."); await adminMenu(chatId); return; }
+    if (rk === "approved") { if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید."); await showOrders(chatId, "approved"); return; }
+    if (rk === "pending") { if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید."); await showOrders(chatId, "pending_approval"); return; }
+    if (rk === "broadcast") {
+      if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید.");
+      dbRun(`UPDATE users SET admin_state='awaiting_broadcast', updated_at=unixepoch() WHERE telegram_id=${tgId}`);
+      await send(chatId,
+        `📢 <b>ارسال پیام همگانی</b>\n${SEPARATOR}\n\n` +
+        `پیامی که می‌خواهید به همه کاربران ارسال شه رو بنویسید:\n\n` +
+        `💡 از HTML استفاده کنید:\n` +
+        `<code>&lt;b&gt;بولد&lt;/b&gt;</code>\n` +
+        `<code>&lt;a href="url"&gt;لینک&lt;/a&gt;</code>`,
+        { reply_markup: { inline_keyboard: [[BTN.danger("انصراف", "admin_back")]] } }
+      );
+      return;
+    }
+    if (rk === "fwd_broadcast") { if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید."); await fwdChannelPicker(chatId, 0); return; }
+  }
+
+  // ===== First-time users get the reply keyboard =====
+  if (!user.kb_sent) {
+    const kbRows = isAdmin(tgId) ? [...REPLY_MAIN, ...REPLY_ADMIN] : REPLY_MAIN;
+    await setReplyKeyboard(chatId, kbRows, `👋 سلام ${esc(firstName)}!\n⌨️ از کیبورد زیر استفاده کنید یا لینک/عدد بفرستید.`);
+    dbRun(`UPDATE users SET kb_sent=1 WHERE id=${user.id}`);
+  }
 
   // === تشخیص کانال ===
   if (text === "/chaninfo") {
@@ -1834,6 +2161,35 @@ async function handleMessage(msg) {
     return;
   }
 
+  // Awaiting forward channel add
+  if (user.admin_state === "set_awaiting_fwd_add") {
+    if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید.");
+    dbRun(`UPDATE users SET admin_state=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`);
+    const channelInput = text.trim();
+    let channelId, channelName;
+    if (channelInput.startsWith("@")) {
+      const chatRes = await api("getChat", { chat_id: channelInput });
+      if (!chatRes.ok) return send(chatId, `❌ کانال <code>${channelInput}</code> یافت نشد.`);
+      channelId = chatRes.result.id;
+      channelName = chatRes.result.title || channelInput;
+    } else {
+      channelId = parseInt(channelInput);
+      if (isNaN(channelId)) return send(chatId, `❌ آیدی نامعتبر بود. عملیات لغو شد.`);
+      const chatRes = await api("getChat", { chat_id: channelId });
+      channelName = chatRes.ok ? (chatRes.result.title || "") : "";
+    }
+    const existing = dbGet(`SELECT * FROM fwd_channels WHERE channel_id=${channelId}`);
+    if (existing) return send(chatId, `⚠️ این کانال قبلاً اضافه شده.`);
+    dbRun(`INSERT INTO fwd_channels (channel_id, channel_name) VALUES (${channelId}, '${String(channelName).replace(/'/g, "''")}')`);
+    await send(chatId,
+      `✅ <b>کانال فوروارد اضافه شد:</b>\n${esc(channelName || channelId)} (<code>${channelId}</code>)\n\n` +
+      `💡 از این به بعد پست‌های جدید این کانال کش میشن.\n` +
+      `برای دیدن لیست: پنل ← «📣 فوروارد همگانی»`,
+      { reply_markup: { inline_keyboard: [[BTN.neutral("📣 فوروارد همگانی", "admin_fwd")]] } }
+    );
+    return;
+  }
+
   // ===== Gift edit input states (gedit_*) =====
   if (freshUser.admin_state && freshUser.admin_state.startsWith("gedit_")) {
     if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید.");
@@ -2293,19 +2649,7 @@ async function handleCallback(cq) {
     // Reset state and cancel pending orders
     dbRun(`UPDATE users SET state='idle', pending_gift_link=NULL, pending_star_count=NULL, admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`);
     dbRun(`UPDATE orders SET status='cancelled', updated_at=unixepoch() WHERE user_id=${user.id} AND status='pending'`);
-    const rate = getNumSetting("exchange_rate");
-    await editSmart(chatId, msgId,
-      `⭐ <b>خرید استار تلگرام</b>\n${SEPARATOR}\n\n` +
-      `💱 <b>نرخ هر ستاره:</b> <code>${fmtPrice(rate)}</code> تومان\n\n` +
-      `${SEPARATOR}\n\n` +
-      `تعداد ستاره مورد نظرتون رو بنویسید:\n` +
-      `(مثال: <code>100</code>, <code>500</code>, <code>1000</code>)`,
-      { reply_markup: { inline_keyboard: [
-        [BTN.success("⭐ 50", "star_q_50"), BTN.success("⭐ 100", "star_q_100"), BTN.success("⭐ 250", "star_q_250")],
-        [BTN.success("⭐ 500", "star_q_500"), BTN.success("⭐ 1000", "star_q_1000")],
-        [BTN.neutral("🔙 بازگشت به منو", "menu_back")],
-      ]}}
-    );
+    await screenStar(chatId, msgId);
     return answer(cq.id);
   }
   if (data === "menu_gift") {
@@ -2333,28 +2677,7 @@ async function handleCallback(cq) {
     // Reset state and cancel pending orders
     dbRun(`UPDATE users SET state='idle', pending_gift_link=NULL, pending_star_count=NULL, admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`);
     dbRun(`UPDATE orders SET status='cancelled', updated_at=unixepoch() WHERE user_id=${user.id} AND status='pending'`);
-    const memberPrice = getNumSetting("member_price");
-    const pricePer100 = fmtPrice(memberPrice);
-    await editSmart(chatId, msgId,
-      `👤 <b>خرید ممبر بدون ریزش</b>\n${SEPARATOR}\n\n` +
-      `تکمیلی سریع ⚡️\n` +
-      `هدف : کانال | گروه 📍\n` +
-      `کنسل ندارد ●\n` +
-      `قیمت هر ۱۰۰ ممبر : <code>${pricePer100}</code> تومان 💸\n` +
-      `حداقل سفارش : ۱۰۰ عدد\n\n` +
-      `${SEPARATOR}\n\n` +
-      `🔹 تعداد مورد نظر خود را از بین ۱۰۰ تا ۱٬۰۰۰ انتخاب کنید:` +
-      (isAdmin(tgId) ? `\n\n📋 <b>گزارش فیک (ادمین):</b> دکمه‌های پایین — همون گزارش بخش خرید رو با اون تعداد به کانال گزارش ارسال می‌کنه.` : ""),
-      { reply_markup: { inline_keyboard: [
-        [BTN.success("100", "member_count_100"), BTN.success("250", "member_count_250"), BTN.success("500", "member_count_500")],
-        [BTN.success("750", "member_count_750"), BTN.success("1000", "member_count_1000")],
-        ...(isAdmin(tgId) ? [
-          [BTN.primary("📋 گزارش فیک 100", "frq_member_100"), BTN.primary("📋 گزارش فیک 250", "frq_member_250"), BTN.primary("📋 گزارش فیک 500", "frq_member_500")],
-          [BTN.primary("📋 گزارش فیک 750", "frq_member_750"), BTN.primary("📋 گزارش فیک 1000", "frq_member_1000")],
-        ] : []),
-        [BTN.neutral("🔙 بازگشت به منو", "menu_back")],
-      ]}}
-    );
+    await screenMember(chatId, tgId, msgId);
     return answer(cq.id);
   }
 
@@ -2394,80 +2717,21 @@ async function handleCallback(cq) {
     return answer(cq.id);
   }
   if (data === "menu_orders") {
-    const u = dbGet(`SELECT * FROM users WHERE telegram_id=${tgId}`);
-    if (u) {
-      const rows = dbAll(`SELECT * FROM orders WHERE user_id=${u.id} ORDER BY id DESC LIMIT 10`);
-      if (!rows.length) {
-        await editSmart(chatId, msgId,
-          `📦 <b>سفارش‌های من</b>\n${SEPARATOR}\n\n` +
-          `📭 <b>هنوز سفارشی ثبت نکردید.</b>\n\n` +
-          `از منوی اصلی خرید کنید!`,
-          { reply_markup: { inline_keyboard: [[BTN.neutral("🔙 بازگشت به منو", "menu_back")]] } }
-        );
-      } else {
-        const si = { pending: "🟡", receipt_sent: "🔵", pending_approval: "🟠", approved: "🟢", rejected: "🔴", completed: "✅", cancelled: "⚫" };
-        const sf = { pending: "در انتظار رسید", receipt_sent: "رسید ارسال شده", pending_approval: "در انتظار تایید", approved: "تایید شده", rejected: "رد شده", completed: "تکمیل شده", cancelled: "لغو شده" };
-        let text = `📦 <b>سفارش‌های من</b>\n${SEPARATOR}\n\n`;
-        for (const o of rows) {
-          const icon = si[o.status] || "❓";
-          const tIcon = typeIcon(o.type);
-          const d = new Date(o.created_at * 1000);
-          const time = `${d.getHours().toString().padStart(2, "0")}:${d.getMinutes().toString().padStart(2, "0")}`;
-          text += `${icon} <b><code>${o.code}</code></b> ${tIcon}\n`;
-          text += `   📊 ${sf[o.status] || o.status}\n`;
-          text += `   💰 ${fmtPrice(o.price_toman)} تومان  •  ${countLabel(o.type)}: <code>${o.star_count}</code>\n`;
-          text += `   📅 ${d.toLocaleDateString("fa-IR")}  🕐 ${time}\n\n`;
-        }
-        await editSmart(chatId, msgId, text, { reply_markup: { inline_keyboard: [[BTN.neutral("🔙 بازگشت به منو", "menu_back")]] } });
-      }
-    }
+    await screenOrders(chatId, tgId, msgId);
     return answer(cq.id);
   }
 
   // ===== Referral menu =====
   if (data === "menu_ref") {
     resetUserState(user.id);
-    const fresh = dbGet(`SELECT * FROM users WHERE id=${user.id}`);
-    let botUsername = globalThis.BOT_USERNAME;
-    if (!botUsername) { const me = await api("getMe"); botUsername = me.result?.username || "bot"; globalThis.BOT_USERNAME = botUsername; }
-    const link = `https://t.me/${botUsername}?start=${tgId}`;
-    const rc = refCountOf(user.id);
-    const text =
-      `🔥 <b>سیستم زیرمجموعه‌گیری فعال شد!</b> 🔥\n\n` +
-      `دوستاتو دعوت کن و استارز بگیر! 💸😎\n\n` +
-      `👤 به ازای هر نفر که با لینک دعوت تو وارد بشه، ۲ هزار تومان به حسابت اضافه میشه!\n\n` +
-      `هرچی زیرمجموعه بیشتر = استارز و گیفت بیشتر💰\n\n` +
-      `🔗 لینک دعوتتو بردار و برای دوستات بفرست؛ شاید همین الان اولین استارز منتظرته! 🚀\n\n` +
-      `${SEPARATOR}\n\n` +
-      `🔗 <b>لینک دعوت شما:</b>\n<code>${link}</code>\n\n` +
-      `👥 <b>زیرمجموعه‌های شما:</b> <code>${rc}</code>\n` +
-      `💰 <b>موجودی کیف پول:</b> <code>${fmtPrice(fresh?.wallet || 0)}</code> تومان`;
-    await editSmart(chatId, msgId, text, { reply_markup: { inline_keyboard: [
-      [BTN.neutral("🔙 بازگشت به منو", "menu_back")],
-    ]}});
+    await screenRef(chatId, tgId, msgId);
     return answer(cq.id);
   }
 
   // ===== Account / wallet menu =====
   if (data === "menu_account") {
     resetUserState(user.id);
-    const fresh = dbGet(`SELECT * FROM users WHERE id=${user.id}`);
-    const orderCount = dbGet(`SELECT COUNT(*) as c FROM orders WHERE user_id=${user.id}`)?.c || 0;
-    const rc = refCountOf(user.id);
-    const joinDate = fresh?.created_at ? new Date(fresh.created_at * 1000).toLocaleDateString("fa-IR") : "—";
-    const text =
-      `👤 <b>حساب کاربری</b>\n${SEPARATOR}\n\n` +
-      `🪪 <b>آیدی عددی:</b> <code>${tgId}</code>\n` +
-      `📛 <b>اسم:</b> ${esc(fresh?.first_name || "—")}\n` +
-      (fresh?.username ? `🔗 <b>یوزرنیم:</b> @${esc(fresh.username)}\n` : "") +
-      `📅 <b>عضویت:</b> ${joinDate}\n\n` +
-      `💳 <b>موجودی کیف پول:</b> <code>${fmtPrice(fresh?.wallet || 0)}</code> تومان\n` +
-      `👥 <b>زیرمجموعه‌ها:</b> <code>${rc}</code>\n` +
-      `📦 <b>تعداد سفارش‌ها:</b> <code>${orderCount}</code>`;
-    await editSmart(chatId, msgId, text, { reply_markup: { inline_keyboard: [
-      [BTN.success("زیر مجموعه گیری 👥", "menu_ref")],
-      [BTN.neutral("🔙 بازگشت به منو", "menu_back")],
-    ]}});
+    await screenAccount(chatId, tgId, msgId);
     return answer(cq.id);
   }
 
@@ -2749,6 +3013,36 @@ async function handleCallback(cq) {
       { reply_markup: { inline_keyboard: [[BTN.danger("انصراف", "admin_back")]] } }
     );
     return answer(cq.id);
+  }
+
+  // ===== Forward broadcast =====
+  if (data === "admin_fwd") {
+    if (!isAdmin(tgId)) return answer(cq.id);
+    await fwdChannelPicker(chatId, msgId);
+    return answer(cq.id);
+  }
+  if (data === "fwd_ch_") return answer(cq.id);
+  if (data.startsWith("fwd_ch_")) {
+    if (!isAdmin(tgId)) return answer(cq.id);
+    await fwdPostPicker(chatId, msgId, parseInt(data.replace("fwd_ch_", "")));
+    return answer(cq.id);
+  }
+  if (data.startsWith("fwd_pick_")) {
+    if (!isAdmin(tgId)) return answer(cq.id);
+    const parts = data.replace("fwd_pick_", "").split("_");
+    const channelId = parseInt(parts[0]), messageId = parseInt(parts[1]);
+    if (!channelId || !messageId) return answer(cq.id, "نامعتبر.", true);
+    await fwdPostConfirm(chatId, msgId, channelId, messageId);
+    return answer(cq.id);
+  }
+  if (data.startsWith("fwd_go_")) {
+    if (!isAdmin(tgId)) return answer(cq.id);
+    const parts = data.replace("fwd_go_", "").split("_");
+    const channelId = parseInt(parts[0]), messageId = parseInt(parts[1]);
+    if (!channelId || !messageId) return answer(cq.id, "نامعتبر.", true);
+    await answer(cq.id, "در حال ارسال...");
+    await fwdPostSend(chatId, msgId, channelId, messageId);
+    return;
   }
 
   // ===== Fake Report Wizard — step 1: fake ID + product type =====
@@ -3181,6 +3475,36 @@ async function handleCallback(cq) {
     return;
   }
 
+  // ===== Forward channels management =====
+  if (data === "set_edit_fwd") {
+    if (!isAdmin(tgId)) return answer(cq.id);
+    await fwdChannelsPanel(chatId, msgId);
+    return answer(cq.id);
+  }
+  if (data === "set_fwd_add") {
+    if (!isAdmin(tgId)) return answer(cq.id);
+    dbRun(`UPDATE users SET admin_state='set_awaiting_fwd_add', updated_at=unixepoch() WHERE telegram_id=${tgId}`);
+    await send(chatId,
+      `🔀 <b>افزودن کانال فوروارد</b>\n${SEPARATOR}\n\n` +
+      `📝 آیدی یا یوزرنیم کانال اصلیت رو بفرستید:\n(مثال: <code>@mychannel</code> یا <code>-1001234567890</code>)\n\n` +
+      `📌 ربات رو ادمین کانال کنید تا پست‌هاش رو ببینه.`,
+      { reply_markup: { inline_keyboard: [[BTN.danger("❌ انصراف", "set_edit_fwd")]] } }
+    );
+    return answer(cq.id);
+  }
+  if (data.startsWith("set_fwd_remove_")) {
+    if (!isAdmin(tgId)) return answer(cq.id);
+    const channelId = parseInt(data.replace("set_fwd_remove_", ""));
+    const ch = dbGet(`SELECT * FROM fwd_channels WHERE channel_id=${channelId}`);
+    if (ch) {
+      dbRun(`DELETE FROM fwd_channels WHERE channel_id=${channelId}`);
+      dbRun(`DELETE FROM fwd_posts WHERE channel_id=${channelId}`);
+      await answer(cq.id, `🗑️ ${ch.channel_name || channelId} حذف شد.`);
+    }
+    await fwdChannelsPanel(chatId, msgId);
+    return;
+  }
+
   // Buy
   if (data.startsWith("buy_")) {
     const oId = parseInt(data.replace("buy_", "")), o = dbGet(`SELECT * FROM orders WHERE id=${oId}`);
@@ -3453,8 +3777,8 @@ let offset = 0;
 async function poll() {
   while (true) {
     try {
-      const r = await api("getUpdates", { offset, timeout: 30, allowed_updates: ["message", "callback_query", "channel_post"] });
-      if (r.ok && r.result) for (const u of r.result) { offset = u.update_id + 1; try { if (u.message) await handleMessage(u.message); else if (u.callback_query) await handleCallback(u.callback_query); else if (u.channel_post) await handleMessage(u.channel_post); } catch (e) { console.error("Error:", e.message); } }
+      const r = await api("getUpdates", { offset, timeout: 30, allowed_updates: ["message", "callback_query", "channel_post", "edited_channel_post"] });
+      if (r.ok && r.result) for (const u of r.result) { offset = u.update_id + 1; try { if (u.message) await handleMessage(u.message); else if (u.callback_query) await handleCallback(u.callback_query); else if (u.channel_post) await handleMessage(u.channel_post); else if (u.edited_channel_post) await handleMessage(u.edited_channel_post); } catch (e) { console.error("Error:", e.message); } }
     } catch (e) { console.error("Poll error:", e.message); await new Promise(r => setTimeout(r, 5000)); }
   }
 }
