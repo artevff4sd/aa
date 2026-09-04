@@ -98,6 +98,7 @@ try { dbRun("SELECT fake FROM orders LIMIT 1"); } catch { dbRun("ALTER TABLE ord
 try { dbRun("SELECT referred_by FROM users LIMIT 1"); } catch { dbRun("ALTER TABLE users ADD COLUMN referred_by INTEGER"); }
 try { dbRun("SELECT wallet FROM users LIMIT 1"); } catch { dbRun("ALTER TABLE users ADD COLUMN wallet INTEGER DEFAULT 0"); }
 try { dbRun("SELECT kb_sent FROM users LIMIT 1"); } catch { dbRun("ALTER TABLE users ADD COLUMN kb_sent INTEGER DEFAULT 0"); }
+try { dbRun("SELECT kb_removed FROM users LIMIT 1"); } catch { dbRun("ALTER TABLE users ADD COLUMN kb_removed INTEGER DEFAULT 0"); }
 
 // ==================== Referral ====================
 const REFERRAL_REWARD = 2000;
@@ -184,6 +185,15 @@ function mainMenuRows(tgId) {
   return rows;
 }
 function mainMenuKb(tgId) { return { reply_markup: { inline_keyboard: mainMenuRows(tgId) } }; }
+
+// حذف فعال کیبورد پایین (کیبورد قبلی سمت کلاینت تلگرام می‌مونه تا با remove_keyboard پاک شه)
+function removeReplyKeyboard(chatId, silent = false) {
+  return api("sendMessage", {
+    chat_id: chatId,
+    text: silent ? "\u200B" : "⌨️ کیبورد پایین حذف شد — از منوی ☰ کنار چت استفاده کنید.",
+    reply_markup: { remove_keyboard: true },
+  });
+}
 
 // ==================== Commands Menu (دکمه ☰ کنار چت) ====================
 const USER_MENU_CMDS = [
@@ -1303,6 +1313,12 @@ async function handleMessage(msg) {
   const user = ensureUser(tgId, username, firstName);
   const freshUser = dbGet(`SELECT * FROM users WHERE id=${user.id}`) || user;
 
+  // یک‌باره: کیبورد پایین قدیمی رو برای کسایی که هنوز دارن حذف کن
+  if (!user.kb_removed) {
+    try { await removeReplyKeyboard(chatId, true); } catch {}
+    dbRun(`UPDATE users SET kb_removed=1 WHERE id=${user.id}`);
+  }
+
   // ===== Maintenance gate (کاربران عادی وقتی بات خاموش است) =====
   if (!isAdmin(tgId) && getSetting("bot_enabled") === "0") {
     return send(chatId,
@@ -2304,6 +2320,10 @@ async function handleMessage(msg) {
   }
 
   // ===== Quick commands (منوی ☰ تلگرام) =====
+  if (text === "/keyboard_off") {
+    dbRun(`UPDATE users SET kb_removed=1 WHERE id=${user.id}`);
+    return removeReplyKeyboard(chatId, false);
+  }
   if (text === "/gifts") { dbRun(`UPDATE users SET state='idle', pending_gift_link=NULL, pending_star_count=NULL, admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`); return showGiftListNew(chatId, 0); }
   if (text === "/stars") { dbRun(`UPDATE users SET state='idle', pending_gift_link=NULL, pending_star_count=NULL, admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`); return screenStar(chatId); }
   if (text === "/member") { dbRun(`UPDATE users SET state='idle', pending_gift_link=NULL, pending_star_count=NULL, admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`); return screenMember(chatId, tgId); }
