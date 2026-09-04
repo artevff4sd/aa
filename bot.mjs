@@ -209,6 +209,34 @@ function removeReplyKeyboard(chatId) {
   return api("sendMessage", { chat_id: chatId, text: "⌨️ کیبورد مخفی شد — از دکمه‌های داخل پیام استفاده کنید.", reply_markup: { remove_keyboard: true } });
 }
 
+// ==================== Commands Menu (دکمه ☰ کنار چت) ====================
+const USER_MENU_CMDS = [
+  { command: "start", description: "🏠 منوی اصلی" },
+  { command: "gifts", description: "🛍 خرید گیفت" },
+  { command: "stars", description: "⭐ خرید استار" },
+  { command: "member", description: "👤 خرید ممبر" },
+  { command: "myorders", description: "📦 سفارش‌های من" },
+  { command: "account", description: "👤 حساب کاربری" },
+  { command: "ref", description: "👥 زیرمجموعه‌گیری" },
+  { command: "support", description: "💬 پشتیبانی" },
+  { command: "cancel", description: "❌ لغو عملیات" },
+];
+const ADMIN_MENU_CMDS = [
+  ...USER_MENU_CMDS,
+  { command: "admin", description: "🛠 پنل مدیریت" },
+  { command: "pending", description: "🟠 در انتظار تایید" },
+  { command: "approved", description: "✅ تایید شده‌ها" },
+  { command: "orders", description: "📦 همه سفارشات" },
+];
+async function setupMenus() {
+  try { await api("setChatMenuButton", { menu_button: { type: "commands" } }); } catch (e) { console.error("setChatMenuButton:", e.message); }
+  try { await api("setMyCommands", { commands: USER_MENU_CMDS, scope: { type: "all_private_chats" } }); } catch (e) { console.error("setMyCommands:", e.message); }
+  for (const adminId of ADMIN_IDS) {
+    try { await api("setMyCommands", { commands: ADMIN_MENU_CMDS, scope: { type: "chat", chat_id: adminId } }); } catch (e) { console.error("setMyCommands(admin):", e.message); }
+  }
+  console.log("☰ Commands menu set.");
+}
+
 // Map of pending admin input states to their cancel-button context
 function replyTextRouter(chatId, tgId, text) {
   const t = text.trim();
@@ -2310,6 +2338,23 @@ async function handleMessage(msg) {
     return;
   }
 
+  // ===== Quick commands (منوی ☰ تلگرام) =====
+  if (text === "/gifts") { dbRun(`UPDATE users SET state='idle', pending_gift_link=NULL, pending_star_count=NULL, admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`); return showGiftListNew(chatId, 0); }
+  if (text === "/stars") { dbRun(`UPDATE users SET state='idle', pending_gift_link=NULL, pending_star_count=NULL, admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`); return screenStar(chatId); }
+  if (text === "/member") { dbRun(`UPDATE users SET state='idle', pending_gift_link=NULL, pending_star_count=NULL, admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`); return screenMember(chatId, tgId); }
+  if (text === "/myorders") { dbRun(`UPDATE users SET state='idle', pending_gift_link=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`); return screenOrders(chatId, tgId); }
+  if (text === "/account") return screenAccount(chatId, tgId);
+  if (text === "/ref") return screenRef(chatId, tgId);
+  if (text === "/support") {
+    const sup = (getSetting("support_username") || DEFAULT_SETTINGS.support_username).replace(/^@/, "");
+    return send(chatId,
+      `💬 <b>پشتیبانی</b>\n${SEPARATOR}\n\n` +
+      `👤 <a href="https://t.me/${sup}">@${sup}</a>\n\n` +
+      `⏰ پاسخگویی: ۹ صبح تا ۱۲ شب`,
+      { reply_markup: { inline_keyboard: [[{ text: "💬 پیام به پشتیبانی", url: `https://t.me/${sup}` }]] } }
+    );
+  }
+
   // Global /cancel — هر ورودی در انتظار (کاربر یا ادمین) رو لغو می‌کنه
   if (text === "/cancel") {
     const hadState = user.state !== "idle" || freshUser.admin_state;
@@ -3798,6 +3843,7 @@ async function main() {
   console.log(`✅ Bot: @${me.result.username}`);
   globalThis.BOT_USERNAME = me.result.username;
   await api("deleteWebhook");
+  await setupMenus();
   console.log("🔄 Polling started! Send /start to your bot.");
   poll();
   setTimeout(scheduledBackup, 60 * 1000);
