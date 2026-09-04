@@ -580,7 +580,7 @@ setInterval(cleanupOldOrders, 6 * 60 * 60 * 1000); // every 6 hours
 function settingsPanelKb() {
   return { reply_markup: { inline_keyboard: [
     [BTN.primary("💳 تغییر شماره کارت", "set_edit_card")],
-    [BTN.primary("🎁 نرخ استار گیفت", "set_edit_gift_rate"), BTN.primary("⭐ نرخ استار خرید", "set_edit_star_rate")],
+    [BTN.primary("🎁 نرخ استار گیفت", "set_edit_gift_rate"), BTN.primary("⭐ نرخ خرید استار", "set_edit_star_rate")],
     [BTN.primary("👤 تغییر قیمت ممبر", "set_edit_member")],
     [BTN.primary("💬 تغییر پشتیبان", "set_edit_support")],
     [BTN.primary("📣 تغییر کانال گزارش", "set_edit_log")],
@@ -609,7 +609,7 @@ function settingsPanelText() {
     `💳 <b>شماره کارت:</b>  <code>${cn}</code>\n` +
     `👤 <b>صاحب کارت:</b>  ${ch}\n` +
     `🎁 <b>نرخ استار گیفت:</b>  <code>${fmtPrice(getGiftRate())}</code> تومان/ستاره\n` +
-    `⭐ <b>نرخ استار خرید:</b>  <code>${fmtPrice(getStarRate())}</code> تومان/ستاره\n` +
+    `⭐ <b>نرخ خرید استار:</b>  <code>${fmtPrice(getStarRate())}</code> تومان/ستاره\n` +
     `👤 <b>قیمت ممبر (هر ۱۰۰):</b>  <code>${fmtPrice(getNumSetting("member_price"))}</code> تومان\n` +
     `💬 <b>پشتیبانی:</b>  @${sup}\n\n` +
     `📣 <b>کانال گزارشات:</b>  ${channel ? `<code>${channel.channel_id}</code> (${channel.channel_name || "-"})` : "❌ تنظیم نشده"}\n` +
@@ -1671,12 +1671,12 @@ async function handleMessage(msg) {
     if (!isAdmin(tgId)) return send(chatId, "❌ شما ادمین نیستید.");
     const parts = text.replace("/setrate", "").trim().split(/\s+/);
     if (parts.length < 2 || !["gift", "star"].includes(parts[0])) {
-      return send(chatId, "📝 <b>فرمت:</b>\n<code>/setrate gift 5000</code> — نرخ استار گیفت\n<code>/setrate star 5000</code> — نرخ استار خرید");
+      return send(chatId, "📝 <b>فرمت:</b>\n<code>/setrate gift 5000</code> — نرخ استار گیفت\n<code>/setrate star 5000</code> — نرخ خرید استار");
     }
     const rate = parseNum(parts[1]);
     if (isNaN(rate) || rate <= 0) return send(chatId, "❌ عدد نامعتبر.");
     if (parts[0] === "gift") { setSetting("gift_star_rate", rate); await send(chatId, `✅ <b>نرخ استار گیفت بروزرسانی شد:</b>\nهر ستاره = <code>${fmtPrice(rate)}</code> تومان`); }
-    else { setSetting("star_buy_rate", rate); await send(chatId, `✅ <b>نرخ استار خرید بروزرسانی شد:</b>\nهر ستاره = <code>${fmtPrice(rate)}</code> تومان`); }
+    else { setSetting("star_buy_rate", rate); await send(chatId, `✅ <b>نرخ خرید استار بروزرسانی شد:</b>\nهر ستاره = <code>${fmtPrice(rate)}</code> تومان`); }
     return;
   }
 
@@ -1961,7 +1961,7 @@ async function handleMessage(msg) {
       return;
     }
     if (isGift) setSetting("gift_star_rate", rate); else setSetting("star_buy_rate", rate);
-    await send(chatId, `✅ <b>${isGift ? "نرخ استار گیفت" : "نرخ استار خرید"} بروزرسانی شد:</b>\nهر ستاره = <code>${fmtPrice(rate)}</code> تومان`);
+    await send(chatId, `✅ <b>${isGift ? "نرخ استار گیفت" : "نرخ خرید استار"} بروزرسانی شد:</b>\nهر ستاره = <code>${fmtPrice(rate)}</code> تومان`);
     await send(chatId, settingsPanelText(), settingsPanelKb());
     return;
   }
@@ -3321,7 +3321,7 @@ async function handleCallback(cq) {
     const isGift = data === "set_edit_gift_rate";
     dbRun(`UPDATE users SET admin_state='${isGift ? "set_awaiting_gift_rate" : "set_awaiting_star_rate"}', updated_at=unixepoch() WHERE telegram_id=${tgId}`);
     await send(chatId,
-      `${isGift ? "🎁 <b>نرخ استار گیفت</b>" : "⭐ <b>نرخ استار خرید</b>"}\n${SEPARATOR}\n\n` +
+      `${isGift ? "🎁 <b>نرخ استار گیفت</b>" : "⭐ <b>نرخ خرید استار</b>"}\n${SEPARATOR}\n\n` +
       `نرخ فعلی: <code>${fmtPrice(isGift ? getGiftRate() : getStarRate())}</code> تومان/ستاره\n\n` +
       `📝 نرخ جدید رو بفرستید:\n(مثال: <code>5000</code>)`,
       { reply_markup: { inline_keyboard: [[BTN.danger("❌ انصراف", "admin_settings")]] } }
