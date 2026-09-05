@@ -195,6 +195,23 @@ function removeReplyKeyboard(chatId, silent = false) {
   });
 }
 
+// اسکن اولیه: برای همه کسایی که قبلاً کیبورد پایین گرفتن، فعالانه remove_keyboard بفرست
+async function sweepStaleKeyboards() {
+  let users;
+  try { users = dbAll("SELECT id, telegram_id FROM users WHERE kb_sent=1 AND (kb_removed IS NULL OR kb_removed=0)"); }
+  catch { return; }
+  if (!users.length) return;
+  let n = 0;
+  for (const u of users) {
+    try {
+      const r = await removeReplyKeyboard(u.telegram_id, true);
+      if (r && r.ok) { dbRun(`UPDATE users SET kb_removed=1 WHERE id=${u.id}`); n++; }
+    } catch {}
+    await new Promise(res => setTimeout(res, 60));
+  }
+  if (n) console.log(`⌨️ کیبورد پایین قدیمی برای ${n} کاربر حذف شد.`);
+}
+
 // ==================== Commands Menu (دکمه ☰ کنار چت) ====================
 const USER_MENU_CMDS = [
   { command: "start", description: "🏠 منوی اصلی" },
@@ -1313,10 +1330,12 @@ async function handleMessage(msg) {
   const user = ensureUser(tgId, username, firstName);
   const freshUser = dbGet(`SELECT * FROM users WHERE id=${user.id}`) || user;
 
-  // یک‌باره: کیبورد پایین قدیمی رو برای کسایی که هنوز دارن حذف کن
+  // یک‌باره: کیبورد پایین قدیمی رو برای کسایی که هنوز دارن حذف کن (فقط وقتی واقعاً موفق شد فلگ بخور)
   if (!user.kb_removed) {
-    try { await removeReplyKeyboard(chatId, true); } catch {}
-    dbRun(`UPDATE users SET kb_removed=1 WHERE id=${user.id}`);
+    try {
+      const r = await removeReplyKeyboard(chatId, true);
+      if (r && r.ok) dbRun(`UPDATE users SET kb_removed=1 WHERE id=${user.id}`);
+    } catch {}
   }
 
   // ===== Maintenance gate (کاربران عادی وقتی بات خاموش است) =====
@@ -3864,6 +3883,7 @@ async function main() {
   globalThis.BOT_USERNAME = me.result.username;
   await api("deleteWebhook");
   await setupMenus();
+  sweepStaleKeyboards().catch(() => {});
   console.log("🔄 Polling started! Send /start to your bot.");
   poll();
   setTimeout(scheduledBackup, 60 * 1000);
