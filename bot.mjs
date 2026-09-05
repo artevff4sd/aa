@@ -196,11 +196,16 @@ function removeReplyKeyboard(chatId) {
 }
 
 // اسکن اولیه: برای همه کسایی که هنوز کیبورد پایینشون پاک نشده، فعالانه remove_keyboard بفرست
+// نسخه ۲: یک‌بار روی «همه» کاربران اجباری اجرا میشه — نسخه‌های قبلی حتی وقتی ارور 400 می‌گرفتن فلگ kb_removed=1 می‌زدن
 async function sweepStaleKeyboards() {
+  const force = getAppFlag("kb_sweep_v2") !== "1";
   let users;
-  try { users = dbAll("SELECT id, telegram_id FROM users WHERE kb_removed IS NULL OR kb_removed=0"); }
-  catch { return; }
-  if (!users.length) return;
+  try {
+    users = force
+      ? dbAll("SELECT id, telegram_id FROM users")
+      : dbAll("SELECT id, telegram_id FROM users WHERE kb_removed IS NULL OR kb_removed=0");
+  } catch { return; }
+  if (!users.length) { if (force) setAppFlag("kb_sweep_v2", "1"); return; }
   let n = 0;
   for (const u of users) {
     try {
@@ -209,7 +214,8 @@ async function sweepStaleKeyboards() {
     } catch {}
     await new Promise(res => setTimeout(res, 60));
   }
-  if (n) console.log(`⌨️ کیبورد پایین برای ${n} کاربر حذف شد.`);
+  if (force) setAppFlag("kb_sweep_v2", "1");
+  console.log(`⌨️ کیبورد پایین برای ${n} کاربر حذف شد${force ? " (اجباری)" : ""}.`);
 }
 
 // ==================== Commands Menu (دکمه ☰ کنار چت) ====================
