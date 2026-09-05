@@ -186,30 +186,30 @@ function mainMenuRows(tgId) {
 }
 function mainMenuKb(tgId) { return { reply_markup: { inline_keyboard: mainMenuRows(tgId) } }; }
 
-// حذف فعال کیبورد پایین (کیبورد قبلی سمت کلاینت تلگرام می‌مونه تا با remove_keyboard پاک شه)
-function removeReplyKeyboard(chatId, silent = false) {
+// حذف فعال کیبورد پایین — دقت: تلگرام متن خیلی کوتاه/خالی رو با 400 رد می‌کنه، پس حتماً متن واقعی بفرست
+function removeReplyKeyboard(chatId) {
   return api("sendMessage", {
     chat_id: chatId,
-    text: silent ? "\u200B" : "⌨️ کیبورد پایین حذف شد — از منوی ☰ کنار چت استفاده کنید.",
+    text: "⌨️ کیبورد پایین حذف شد — از این به بعد همه‌چیز با دکمه‌های داخل پیامه.",
     reply_markup: { remove_keyboard: true },
   });
 }
 
-// اسکن اولیه: برای همه کسایی که قبلاً کیبورد پایین گرفتن، فعالانه remove_keyboard بفرست
+// اسکن اولیه: برای همه کسایی که هنوز کیبورد پایینشون پاک نشده، فعالانه remove_keyboard بفرست
 async function sweepStaleKeyboards() {
   let users;
-  try { users = dbAll("SELECT id, telegram_id FROM users WHERE kb_sent=1 AND (kb_removed IS NULL OR kb_removed=0)"); }
+  try { users = dbAll("SELECT id, telegram_id FROM users WHERE kb_removed IS NULL OR kb_removed=0"); }
   catch { return; }
   if (!users.length) return;
   let n = 0;
   for (const u of users) {
     try {
-      const r = await removeReplyKeyboard(u.telegram_id, true);
+      const r = await removeReplyKeyboard(u.telegram_id);
       if (r && r.ok) { dbRun(`UPDATE users SET kb_removed=1 WHERE id=${u.id}`); n++; }
     } catch {}
     await new Promise(res => setTimeout(res, 60));
   }
-  if (n) console.log(`⌨️ کیبورد پایین قدیمی برای ${n} کاربر حذف شد.`);
+  if (n) console.log(`⌨️ کیبورد پایین برای ${n} کاربر حذف شد.`);
 }
 
 // ==================== Commands Menu (دکمه ☰ کنار چت) ====================
@@ -1330,10 +1330,10 @@ async function handleMessage(msg) {
   const user = ensureUser(tgId, username, firstName);
   const freshUser = dbGet(`SELECT * FROM users WHERE id=${user.id}`) || user;
 
-  // یک‌باره: کیبورد پایین قدیمی رو برای کسایی که هنوز دارن حذف کن (فقط وقتی واقعاً موفق شد فلگ بخور)
+  // یک‌باره: کیبورد پایین قدیمی رو حذف کن — فقط وقتی واقعاً موفق شد فلگ بخور تا دوباره تلاش شه
   if (!user.kb_removed) {
     try {
-      const r = await removeReplyKeyboard(chatId, true);
+      const r = await removeReplyKeyboard(chatId);
       if (r && r.ok) dbRun(`UPDATE users SET kb_removed=1 WHERE id=${user.id}`);
     } catch {}
   }
@@ -2341,7 +2341,7 @@ async function handleMessage(msg) {
   // ===== Quick commands (منوی ☰ تلگرام) =====
   if (text === "/keyboard_off") {
     dbRun(`UPDATE users SET kb_removed=1 WHERE id=${user.id}`);
-    return removeReplyKeyboard(chatId, false);
+    return removeReplyKeyboard(chatId);
   }
   if (text === "/gifts") { dbRun(`UPDATE users SET state='idle', pending_gift_link=NULL, pending_star_count=NULL, admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`); return showGiftListNew(chatId, 0); }
   if (text === "/stars") { dbRun(`UPDATE users SET state='idle', pending_gift_link=NULL, pending_star_count=NULL, admin_state=NULL, admin_state_data=NULL, updated_at=unixepoch() WHERE telegram_id=${tgId}`); return screenStar(chatId); }
